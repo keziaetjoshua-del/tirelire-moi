@@ -1,15 +1,20 @@
 # bot_tirelire_moi.py
 # Tirelire Météo Pension - Bot Polymarket météo ultra-safe
-# v1.8 — Anti-spam villes : 1 analyse/ville/cycle, délai inter-ville,
-#         déduplication consensus, rotation équitable sur toutes les villes
+# v1.9 — Rotation équitable des villes :
+#         • max CITIES_PER_CYCLE villes par cycle
+#         • rotation round-robin pondérée (priorité légère NYC/London/Chicago)
+#         • 1 seul consensus météo par ville par cycle
+#         • délai INTER_CITY_DELAY entre chaque ville
 
 import os
 import csv
 import json
 import time
+import math
 import logging
 import requests
 import urllib3
+import random
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -25,23 +30,25 @@ TRADES_CSV       = DATA_DIR / "trades.csv"
 CALIBRATION_JSON = DATA_DIR / "calibration.json"
 STATE_JSON       = DATA_DIR / "state.json"
 TAG_CACHE_JSON   = DATA_DIR / "tag_cache.json"
+ROTATION_JSON    = DATA_DIR / "rotation.json"   # état de la rotation inter-cycles
 
 PRIVATE_KEY    = os.getenv("PRIVATE_KEY", "")
 NOAA_API_TOKEN = os.getenv("NOAA_API_TOKEN", "")
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
-OPEN_METEO_PRIMARY = "https://api.open-meteo.com/v1/forecast"
-
-SCAN_INTERVAL       = int(os.getenv("SCAN_INTERVAL",       "900"))
-EV_THRESHOLD        = float(os.getenv("EV_THRESHOLD",      "0.10"))
-EV_THRESHOLD_STRONG = float(os.getenv("EV_THRESHOLD_STRONG","0.08"))
+SCAN_INTERVAL       = int(os.getenv("SCAN_INTERVAL",        "900"))
+EV_THRESHOLD        = float(os.getenv("EV_THRESHOLD",       "0.10"))  # 10% défaut
+EV_THRESHOLD_STRONG = float(os.getenv("EV_THRESHOLD_STRONG","0.08"))  # 8% si 3 sources STRONG
 DAILY_LOSS_LIMIT    = float(os.getenv("DAILY_LOSS_LIMIT",   "0.03"))
-MIN_BINS            = int(os.getenv("MIN_BINS", "5"))
-MAX_BINS            = int(os.getenv("MAX_BINS", "10"))
+MIN_BINS            = int(os.getenv("MIN_BINS",   "5"))
+MAX_BINS            = int(os.getenv("MAX_BINS",  "10"))
 
-# Délai poli entre chaque ville pour ne pas saturer Open-Meteo ni spammer les logs
-INTER_CITY_DELAY = float(os.getenv("INTER_CITY_DELAY", "2.5"))   # secondes
+# Rotation : combien de villes traiter par cycle (8–10 max pour rester rapide)
+CITIES_PER_CYCLE = int(os.getenv("CITIES_PER_CYCLE", "9"))
+# Délai entre chaque ville (respecte Open-Meteo + lisibilité des logs)
+INTER_CITY_DELAY = float(os.getenv("INTER_CITY_DELAY", "1.5"))
 
-# Polymarket endpoints
+# Polymarket
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE  = "https://clob.polymarket.com"
 DATA_BASE  = "https://data-api.polymarket.com"
@@ -57,7 +64,7 @@ API_RETRY_DELAYS    = [1, 3, 8]
 API_USER_AGENT      = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36 TirelireMeteoPension/1.8"
+    "Chrome/124.0.0.0 Safari/537.36 TirelireMeteoPension/1.9"
 )
 
 OM_TIMEOUT_CONNECT = 8
@@ -65,34 +72,35 @@ OM_TIMEOUT_READ    = 15
 OM_MAX_RETRIES     = 3
 OM_RETRY_DELAYS    = [1, 2, 4]
 
-# Villes surveillées, triées par priorité décroissante
+# ── Catalogue des villes — priorité 1..10 (10 = plus fort) ────────────────────
+# La priorité influe sur la FRÉQUENCE de sélection, pas sur l'exclusivité.
 CITIES = [
-    {"name": "New York",    "lat": 40.71, "lon": -74.00,
-     "aliases": ["new york", "nyc", "ny ", "new-york", "manhattan"], "priority": 10},
-    {"name": "Chicago",     "lat": 41.88, "lon": -87.63,
-     "aliases": ["chicago", "chi "], "priority": 9},
-    {"name": "Los Angeles", "lat": 34.05, "lon": -118.24,
-     "aliases": ["los angeles", "la ", "l.a.", "los-angeles"], "priority": 8},
-    {"name": "Miami",       "lat": 25.76, "lon":  -80.19,
-     "aliases": ["miami"], "priority": 8},
-    {"name": "Dallas",      "lat": 32.78, "lon":  -96.80,
-     "aliases": ["dallas", "dfw"], "priority": 7},
-    {"name": "Seattle",     "lat": 47.61, "lon": -122.33,
-     "aliases": ["seattle"], "priority": 7},
-    {"name": "Boston",      "lat": 42.36, "lon":  -71.06,
-     "aliases": ["boston"], "priority": 7},
-    {"name": "Washington",  "lat": 38.91, "lon":  -77.04,
-     "aliases": ["washington", "dc ", "d.c."], "priority": 7},
-    {"name": "London",      "lat": 51.51, "lon":  -0.13,
-     "aliases": ["london", "uk temperature", "england weather"], "priority": 6},
-    {"name": "Paris",       "lat": 48.85, "lon":   2.35,
-     "aliases": ["paris", "france temperature"], "priority": 5},
-    {"name": "Berlin",      "lat": 52.52, "lon":  13.41,
-     "aliases": ["berlin", "germany temperature"], "priority": 4},
-    {"name": "Lyon",        "lat": 45.75, "lon":   4.85,
-     "aliases": ["lyon"], "priority": 3},
-    {"name": "Marseille",   "lat": 43.30, "lon":   5.37,
-     "aliases": ["marseille"], "priority": 3},
+    {"name": "New York",    "lat": 40.71, "lon": -74.00, "priority": 10,
+     "aliases": ["new york", "nyc", "ny ", "new-york", "manhattan"]},
+    {"name": "Chicago",     "lat": 41.88, "lon": -87.63, "priority": 9,
+     "aliases": ["chicago", "chi "]},
+    {"name": "Los Angeles", "lat": 34.05, "lon": -118.24, "priority": 8,
+     "aliases": ["los angeles", "la ", "l.a.", "los-angeles"]},
+    {"name": "Miami",       "lat": 25.76, "lon":  -80.19, "priority": 8,
+     "aliases": ["miami"]},
+    {"name": "Dallas",      "lat": 32.78, "lon":  -96.80, "priority": 7,
+     "aliases": ["dallas", "dfw"]},
+    {"name": "Seattle",     "lat": 47.61, "lon": -122.33, "priority": 7,
+     "aliases": ["seattle"]},
+    {"name": "Boston",      "lat": 42.36, "lon":  -71.06, "priority": 7,
+     "aliases": ["boston"]},
+    {"name": "Washington",  "lat": 38.91, "lon":  -77.04, "priority": 7,
+     "aliases": ["washington", "dc ", "d.c."]},
+    {"name": "London",      "lat": 51.51, "lon":  -0.13, "priority": 6,
+     "aliases": ["london", "uk temperature", "england weather"]},
+    {"name": "Paris",       "lat": 48.85, "lon":   2.35, "priority": 5,
+     "aliases": ["paris", "france temperature"]},
+    {"name": "Berlin",      "lat": 52.52, "lon":  13.41, "priority": 4,
+     "aliases": ["berlin", "germany temperature"]},
+    {"name": "Lyon",        "lat": 45.75, "lon":   4.85, "priority": 3,
+     "aliases": ["lyon"]},
+    {"name": "Marseille",   "lat": 43.30, "lon":   5.37, "priority": 3,
+     "aliases": ["marseille"]},
 ]
 
 WEATHER_KEYWORDS = [
@@ -134,8 +142,8 @@ def _safe_float(value, default: float = 0.0) -> float:
 def _safe_first(lst, default=None):
     if not lst:
         return default
-    val = lst[0] if isinstance(lst, (list, tuple)) else default
-    return val if val is not None else default
+    v = lst[0] if isinstance(lst, (list, tuple)) else default
+    return v if v is not None else default
 
 def _fmt(value, digits: int = 1, fallback: str = "N/A") -> str:
     if value is None:
@@ -146,9 +154,98 @@ def _fmt(value, digits: int = 1, fallback: str = "N/A") -> str:
         return fallback
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Session Open-Meteo dédiée — retry + SSL fallback ─────────────────────────
+# ── Rotation équitable des villes ────────────────────────────────────────────
+#
+# Algorithme :
+#   Chaque ville a un "crédit" cumulatif = priority / somme_priorities.
+#   À chaque cycle, on sélectionne les CITIES_PER_CYCLE villes dont
+#   le crédit est le plus élevé, puis on décrémente leur crédit de 1.
+#   Cela garantit que toutes les villes passent, avec une fréquence
+#   proportionnelle à leur priorité — sans jamais bloquer les faibles.
+#
+# Persistance : rotation.json (survit aux redémarrages Railway)
 # ══════════════════════════════════════════════════════════════════════════════
-def _build_openmeteo_session(verify_ssl: bool = True) -> requests.Session:
+class CityRotation:
+    """Rotation pondérée équitable des villes."""
+
+    def __init__(self, cities: list[dict], per_cycle: int):
+        self.cities    = cities
+        self.per_cycle = per_cycle
+        self._credits  = {c["name"]: 0.0 for c in cities}
+        self._load()
+
+    # ── Persistance ────────────────────────────────────────────────────────
+    def _load(self):
+        if ROTATION_JSON.exists():
+            try:
+                with open(ROTATION_JSON) as f:
+                    saved = json.load(f)
+                for name in self._credits:
+                    if name in saved:
+                        self._credits[name] = float(saved[name])
+                log.info("  🔄 Rotation chargée depuis rotation.json")
+                return
+            except Exception:
+                pass
+        self._reset_credits()
+
+    def _save(self):
+        try:
+            with open(ROTATION_JSON, "w") as f:
+                json.dump(self._credits, f, indent=2)
+        except Exception:
+            pass
+
+    def _reset_credits(self):
+        total = sum(c["priority"] for c in self.cities)
+        for c in self.cities:
+            self._credits[c["name"]] = c["priority"] / total
+
+    # ── Sélection du cycle ──────────────────────────────────────────────────
+    def select(self, available_names: set[str]) -> list[dict]:
+        """
+        Sélectionne jusqu'à `per_cycle` villes parmi `available_names`
+        (villes ayant des marchés actifs ce cycle).
+
+        Étapes :
+        1. Accumule les crédits (priority / total) pour toutes les villes.
+        2. Parmi celles disponibles, prend les per_cycle avec le plus de crédit.
+        3. Décrémente leur crédit de 1.0 (dette).
+        4. Sauvegarde.
+        """
+        total = sum(c["priority"] for c in self.cities)
+
+        # Accumulation des crédits
+        for c in self.cities:
+            self._credits[c["name"]] += c["priority"] / total
+
+        # Candidats : villes disponibles triées par crédit décroissant,
+        # avec un léger bruit aléatoire pour éviter les ex-æquo figés
+        candidates = sorted(
+            [c for c in self.cities if c["name"] in available_names],
+            key=lambda c: self._credits[c["name"]] + random.uniform(0, 0.02),
+            reverse=True,
+        )
+
+        selected = candidates[: self.per_cycle]
+
+        # Débite les villes sélectionnées
+        for c in selected:
+            self._credits[c["name"]] -= 1.0
+
+        self._save()
+
+        names = [c["name"] for c in selected]
+        log.info(
+            f"  🔀 Rotation cycle : {', '.join(names)} "
+            f"({len(selected)}/{len(available_names)} dispo)"
+        )
+        return selected
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Session Open-Meteo — retry + SSL fallback ─────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+def _build_om_session(verify_ssl: bool = True) -> requests.Session:
     s = requests.Session()
     retry = Retry(
         total=OM_MAX_RETRIES,
@@ -159,45 +256,39 @@ def _build_openmeteo_session(verify_ssl: bool = True) -> requests.Session:
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.mount("http://",  HTTPAdapter(max_retries=retry))
-    s.headers.update({"User-Agent": API_USER_AGENT})
+    s.headers["User-Agent"] = API_USER_AGENT
     s.verify = verify_ssl
     return s
 
-_om_session_ssl   = _build_openmeteo_session(verify_ssl=True)
-_om_session_nossl = _build_openmeteo_session(verify_ssl=False)
+_om_ssl   = _build_om_session(verify_ssl=True)
+_om_nossl = _build_om_session(verify_ssl=False)
 
-def _om_get(params: dict, label: str) -> dict | None:
+def _om_get(params: dict) -> dict | None:
+    """GET Open-Meteo avec retry urllib3 + fallback no-SSL silencieux."""
     for attempt in range(1, OM_MAX_RETRIES + 1):
-        for session in (_om_session_ssl, _om_session_nossl):
+        for session in (_om_ssl, _om_nossl):
             try:
-                r = session.get(
-                    OPEN_METEO_PRIMARY, params=params,
-                    timeout=(OM_TIMEOUT_CONNECT, OM_TIMEOUT_READ),
-                )
+                r     = session.get(OPEN_METEO_URL, params=params,
+                                    timeout=(OM_TIMEOUT_CONNECT, OM_TIMEOUT_READ))
                 r.raise_for_status()
                 data  = r.json()
                 daily = data.get("daily", {})
-                if not daily:
-                    continue
                 temps = daily.get("temperature_2m_max") or []
-                if not temps or temps[0] is None:
-                    continue
-                return data
+                if temps and temps[0] is not None:
+                    return data
             except requests.exceptions.SSLError:
-                continue
+                continue   # bascule sur no-SSL
             except (requests.exceptions.ConnectTimeout,
                     requests.exceptions.ReadTimeout,
                     requests.exceptions.ConnectionError):
-                break
+                break      # retry dans la boucle extérieure
             except Exception:
                 return None
         if attempt < OM_MAX_RETRIES:
             time.sleep(OM_RETRY_DELAYS[min(attempt - 1, len(OM_RETRY_DELAYS) - 1)])
     return None
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── safe_api_call — Polymarket ────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ── safe_api_call — Polymarket ─────────────────────────────────────────────────
 def safe_api_call(session: requests.Session, method: str, url: str,
                   label: str = "API", **kwargs):
     kwargs.setdefault("timeout", (API_TIMEOUT_CONNECT, API_TIMEOUT_READ))
@@ -226,8 +317,7 @@ def safe_api_call(session: requests.Session, method: str, url: str,
                     log.info(f"  ✅ [{label}] Succès après {attempt} tentatives")
                 return data
             except ValueError:
-                preview = raw[:120].replace("\n", " ")
-                log.warning(f"  ⚠️  [{label}] JSON invalide «{preview}» — tentative {attempt}/{max_attempts}")
+                log.warning(f"  ⚠️  [{label}] JSON invalide — tentative {attempt}/{max_attempts}")
                 continue
         except requests.exceptions.ConnectTimeout:
             log.warning(f"  ⏱️  [{label}] ConnectTimeout — tentative {attempt}/{max_attempts}")
@@ -236,10 +326,10 @@ def safe_api_call(session: requests.Session, method: str, url: str,
         except requests.exceptions.ConnectionError as e:
             log.warning(f"  🔌 [{label}] ConnectionError: {e} — tentative {attempt}/{max_attempts}")
         except Exception as e:
-            log.error(f"  💥 [{label}] Erreur inattendue: {e}")
+            log.error(f"  💥 [{label}] Erreur: {e}")
             break
 
-    log.error(f"  ❌ [{label}] Unavailable — abandon après {max_attempts} tentatives.")
+    log.error(f"  ❌ [{label}] Abandon après {max_attempts} tentatives.")
     return None
 
 def build_session() -> requests.Session:
@@ -324,7 +414,7 @@ def compute_bet_size(balance: float) -> float:
         return min(balance * 0.0125, 20.0)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── APIs Météo ────────────────────────────────────────────────────────────────
+# ── APIs Météo : GFS + ECMWF (Open-Meteo) + NOAA optionnel ───────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 def _extract_daily(data: dict, source: str) -> dict | None:
     daily      = data.get("daily", {})
@@ -344,37 +434,33 @@ def _extract_daily(data: dict, source: str) -> dict | None:
     }
 
 def fetch_gfs(lat: float, lon: float) -> dict | None:
-    params = {
+    data = _om_get({
         "latitude": lat, "longitude": lon,
         "daily":    "temperature_2m_max,temperature_2m_min,precipitation_sum",
         "forecast_days": 7, "timezone": "UTC", "models": "gfs_seamless",
-    }
-    data = _om_get(params, "GFS")
+    })
     return _extract_daily(data, "GFS") if data else None
 
 def fetch_ecmwf(lat: float, lon: float) -> dict | None:
     for model in ("ecmwf_ifs04", "ecmwf_ifs025"):
-        params = {
+        data = _om_get({
             "latitude": lat, "longitude": lon,
             "daily":    "temperature_2m_max,temperature_2m_min,precipitation_sum",
             "forecast_days": 7, "timezone": "UTC", "models": model,
-        }
-        data = _om_get(params, f"ECMWF/{model}")
+        })
         if data:
-            result = _extract_daily(data, "ECMWF")
-            if result:
-                return result
+            r = _extract_daily(data, "ECMWF")
+            if r:
+                return r
     return None
 
 def fetch_noaa_api(lat: float, lon: float) -> dict | None:
     if not NOAA_API_TOKEN:
         return None
     try:
-        hdrs = {"User-Agent": "TirelireMeteoPension/1.8", "token": NOAA_API_TOKEN}
-        r = requests.get(
-            f"https://api.weather.gov/points/{lat},{lon}",
-            headers=hdrs, timeout=(8, 15),
-        )
+        hdrs = {"User-Agent": "TirelireMeteoPension/1.9", "token": NOAA_API_TOKEN}
+        r = requests.get(f"https://api.weather.gov/points/{lat},{lon}",
+                         headers=hdrs, timeout=(8, 15))
         if r.status_code != 200:
             return None
         forecast_url = r.json().get("properties", {}).get("forecast")
@@ -385,47 +471,37 @@ def fetch_noaa_api(lat: float, lon: float) -> dict | None:
         periods = r2.json().get("properties", {}).get("periods", [])
         if not periods:
             return None
-        day_period = next(
-            (p for p in periods[:4] if p.get("isDaytime", True)), periods[0]
-        )
-        temp_f = _safe_float(day_period.get("temperature"), default=None)
-        if temp_f is None:
+        day = next((p for p in periods[:4] if p.get("isDaytime", True)), periods[0])
+        tf  = _safe_float(day.get("temperature"), default=None)
+        if tf is None:
             return None
-        return {
-            "source":    "NOAA_API",
-            "temp_max":  round((temp_f - 32) * 5 / 9, 1),
-            "temp_min":  None,
-            "precip_mm": None,
-        }
+        return {"source": "NOAA_API", "temp_max": round((tf - 32) * 5 / 9, 1),
+                "temp_min": None, "precip_mm": None}
     except Exception:
         return None
 
 def build_consensus_forecast(city: dict) -> dict | None:
     """
-    Agrège GFS + ECMWF + NOAA. Retourne None si < 2 sources valides.
+    Agrège GFS + ECMWF + NOAA.
     Seuil EV adaptatif : 8% si 3 sources STRONG, 10% sinon.
+    Retourne None si < 2 sources valides.
     """
     lat, lon  = city["lat"], city["lon"]
     forecasts = []
 
-    for fetch_fn, name in [
-        (fetch_gfs,      "GFS"),
-        (fetch_ecmwf,    "ECMWF"),
-        (fetch_noaa_api, "NOAA_API"),
-    ]:
+    for fn, name in [(fetch_gfs, "GFS"), (fetch_ecmwf, "ECMWF"),
+                     (fetch_noaa_api, "NOAA_API")]:
         try:
-            result = fetch_fn(lat, lon)
+            r = fn(lat, lon)
         except Exception:
-            result = None
-        if result is None:
+            r = None
+        if r is None:
             continue
-        temp_max = result.get("temp_max")
-        if not isinstance(temp_max, (int, float)):
+        tm = r.get("temp_max")
+        if not isinstance(tm, (int, float)) or math.isnan(tm):
             continue
-        if temp_max != temp_max:   # NaN check
-            continue
-        result["temp_max"] = float(temp_max)
-        forecasts.append(result)
+        r["temp_max"] = float(tm)
+        forecasts.append(r)
 
     if len(forecasts) < 2:
         return None
@@ -434,24 +510,19 @@ def build_consensus_forecast(city: dict) -> dict | None:
     avg_temp = sum(temps) / len(temps)
     spread   = max(temps) - min(temps)
 
-    consensus = (
-        "STRONG"   if spread < 1.0 else
-        "MODERATE" if spread < 2.5 else
-        "WEAK"
-    )
+    consensus    = "STRONG" if spread < 1.0 else "MODERATE" if spread < 2.5 else "WEAK"
     ev_threshold = (
-        EV_THRESHOLD_STRONG
-        if consensus == "STRONG" and len(forecasts) >= 3
+        EV_THRESHOLD_STRONG if consensus == "STRONG" and len(forecasts) >= 3
         else EV_THRESHOLD
     )
 
-    precip_vals = [f["precip_mm"] for f in forecasts if f.get("precip_mm") is not None]
-    avg_precip  = round(sum(precip_vals) / len(precip_vals), 1) if precip_vals else 0.0
-    sources_names = [f["source"] for f in forecasts]
+    precips    = [f["precip_mm"] for f in forecasts if f.get("precip_mm") is not None]
+    avg_precip = round(sum(precips) / len(precips), 1) if precips else 0.0
+    models     = [f["source"] for f in forecasts]
 
     log.info(
-        f"    🌡️  {city['name']} | {_fmt(avg_temp)}°C ± {_fmt(spread)}°C "
-        f"[{consensus}] {sources_names} EV≥{ev_threshold*100:.0f}%"
+        f"    🌡️  {city['name']} {_fmt(avg_temp)}°C ± {_fmt(spread)}°C "
+        f"[{consensus}] {models} EV≥{ev_threshold*100:.0f}%"
     )
 
     return {
@@ -461,21 +532,13 @@ def build_consensus_forecast(city: dict) -> dict | None:
         "spread":       round(spread, 2),
         "consensus":    consensus,
         "sources":      len(forecasts),
-        "models":       sources_names,
+        "models":       models,
         "ev_threshold": ev_threshold,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Helpers filtre marchés météo ──────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
-def _text_is_weather(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in WEATHER_KEYWORDS)
-
-def _slug_is_weather(slug: str) -> bool:
-    s = slug.lower()
-    return any(k in s for k in WEATHER_SLUG_KEYWORDS)
-
 def _market_search_text(market: dict) -> str:
     return " ".join([
         market.get("question",       ""),
@@ -490,10 +553,10 @@ def _market_search_text(market: dict) -> str:
     ]).lower()
 
 def _is_weather_market(market: dict) -> bool:
-    return (
-        _text_is_weather(_market_search_text(market)) or
-        _slug_is_weather(market.get("slug", ""))
-    )
+    text = _market_search_text(market)
+    slug = market.get("slug", "").lower()
+    return (any(k in text for k in WEATHER_KEYWORDS) or
+            any(k in slug for k in WEATHER_SLUG_KEYWORDS))
 
 def _market_city(market: dict) -> dict | None:
     text = _market_search_text(market)
@@ -505,21 +568,21 @@ def _market_city(market: dict) -> dict | None:
 def _market_priority(market: dict) -> tuple:
     city  = _market_city(market)
     prio  = city["priority"] if city else 0
-    vol24 = _safe_float(market.get("volume24hr") or market.get("volume_24hr"), 0.0)
+    vol24 = _safe_float(market.get("volume24hr") or market.get("volume_24hr"))
     return (prio, vol24)
 
 def _extract_markets_from_events(events: list) -> list:
     markets = []
     for event in events:
-        event_tags  = event.get("tags",  [])
-        event_title = event.get("title", "")
-        event_slug  = event.get("slug",  "")
+        tags  = event.get("tags",  [])
+        title = event.get("title", "")
+        slug  = event.get("slug",  "")
         for m in event.get("markets", []):
-            m.setdefault("tags", event_tags)
+            m.setdefault("tags", tags)
             if not m.get("groupItemTitle"):
-                m["groupItemTitle"] = event_title
+                m["groupItemTitle"] = title
             if not m.get("eventSlug"):
-                m["eventSlug"] = event_slug
+                m["eventSlug"] = slug
             markets.append(m)
     return markets
 
@@ -558,7 +621,7 @@ class PolymarketClient:
             if self.w3.is_connected():
                 log.info(f"⛓️  Polygon connecté (block #{self.w3.eth.block_number})")
             else:
-                log.warning("⚠️  Polygon RPC non connecté — redeem désactivé")
+                log.warning("⚠️  Polygon RPC non connecté")
                 self.w3 = None
         except ImportError:
             log.warning("web3 non installé — redeem désactivé")
@@ -575,7 +638,7 @@ class PolymarketClient:
                 if now < cached.get("expires", 0):
                     self._weather_tag_id = cached["tag_id"]
                     self._tag_cache_ttl  = cached["expires"]
-                    log.info(f"  📎 Tag weather (cache) : id={self._weather_tag_id}")
+                    log.info(f"  📎 Tag weather cache id={self._weather_tag_id}")
                     return self._weather_tag_id
             except Exception:
                 pass
@@ -590,126 +653,45 @@ class PolymarketClient:
                 continue
             tags = data if isinstance(data, list) else data.get("tags", [])
             for tag in tags:
-                label = (tag.get("label", "") + " " + tag.get("slug", "")).lower()
-                if "weather" in label:
-                    tag_id = int(tag.get("id", 0))
-                    if tag_id:
-                        log.info(f"  ✅ Tag weather id={tag_id} ('{tag.get('label')}')")
-                        self._weather_tag_id = tag_id
+                lbl = (tag.get("label", "") + " " + tag.get("slug", "")).lower()
+                if "weather" in lbl:
+                    tid = int(tag.get("id", 0))
+                    if tid:
+                        log.info(f"  ✅ Tag weather id={tid} '{tag.get('label')}'")
+                        self._weather_tag_id = tid
                         self._tag_cache_ttl  = now + 86400
                         try:
                             with open(TAG_CACHE_JSON, "w") as f:
-                                json.dump({"tag_id": tag_id, "expires": self._tag_cache_ttl}, f)
+                                json.dump({"tag_id": tid, "expires": self._tag_cache_ttl}, f)
                         except Exception:
                             pass
-                        return tag_id
-        log.warning("  ⚠️  Tag 'weather' introuvable → filtre textuel")
+                        return tid
+        log.warning("  ⚠️  Tag 'weather' introuvable")
         return None
 
-    def _fetch_events_by_weather_tag(self, tag_id: int, limit: int = 200) -> list:
+    def _paginate_events(self, params: dict, label: str,
+                         max_markets: int = 300) -> list:
         all_markets = []
         offset      = 0
-        page_size   = 50
-        log.info(f"  📡 [L1] /events?tag_id={tag_id}")
-        while len(all_markets) < limit:
-            data = safe_api_call(
-                self.session, "GET", f"{GAMMA_BASE}/events",
-                label=f"gamma/events_tag",
-                params={
-                    "tag_id": tag_id, "related_tags": "true",
-                    "active": "true", "closed": "false",
-                    "order": "volume24hr", "ascending": "false",
-                    "limit": page_size, "offset": offset,
-                },
-            )
+        page_size   = params.get("limit", 50)
+        while len(all_markets) < max_markets:
+            p = {**params, "offset": offset}
+            data = safe_api_call(self.session, "GET",
+                                 f"{GAMMA_BASE}/events", label=label, params=p)
             if not data:
                 break
             events = data if isinstance(data, list) else data.get("data", [])
             if not events:
                 break
-            batch = _extract_markets_from_events(events)
-            all_markets.extend(batch)
-            has_more = (
-                data.get("has_more", False) if isinstance(data, dict)
-                else len(events) == page_size
-            )
+            all_markets.extend(_extract_markets_from_events(events))
+            has_more = (data.get("has_more", False) if isinstance(data, dict)
+                        else len(events) == page_size)
             if not has_more:
                 break
             offset += page_size
-        log.info(f"  ✅ [L1] {len(all_markets)} marchés")
         return all_markets
 
-    def _fetch_events_textual_filter(self, limit: int = 500) -> list:
-        weather_markets = []
-        offset          = 0
-        page_size       = 100
-        events_scanned  = 0
-        log.info(f"  📡 [L2] /events actifs + filtre textuel")
-        while len(weather_markets) < limit and events_scanned < 1000:
-            data = safe_api_call(
-                self.session, "GET", f"{GAMMA_BASE}/events",
-                label="gamma/events_all",
-                params={
-                    "active": "true", "closed": "false",
-                    "order": "volume24hr", "ascending": "false",
-                    "limit": page_size, "offset": offset,
-                },
-            )
-            if not data:
-                break
-            events = data if isinstance(data, list) else data.get("data", [])
-            if not events:
-                break
-            events_scanned += len(events)
-            for m in _extract_markets_from_events(events):
-                if _is_weather_market(m):
-                    weather_markets.append(m)
-            has_more = (
-                data.get("has_more", False) if isinstance(data, dict)
-                else len(events) == page_size
-            )
-            if not has_more:
-                break
-            offset += page_size
-        log.info(f"  ✅ [L2] {len(weather_markets)} marchés météo / {events_scanned} events")
-        return weather_markets
-
-    def _fetch_markets_direct_filter(self, limit: int = 300) -> list:
-        weather_markets = []
-        offset          = 0
-        page_size       = 100
-        markets_scanned = 0
-        log.info("  📡 [L3/fallback] /markets direct")
-        while len(weather_markets) < limit and markets_scanned < 1000:
-            data = safe_api_call(
-                self.session, "GET", f"{GAMMA_BASE}/markets",
-                label="gamma/markets",
-                params={
-                    "active": "true", "closed": "false",
-                    "order": "volume24hr", "ascending": "false",
-                    "limit": page_size, "offset": offset,
-                },
-            )
-            if not data:
-                break
-            markets = data if isinstance(data, list) else data.get("data", [])
-            if not markets:
-                break
-            markets_scanned += len(markets)
-            for m in markets:
-                if _is_weather_market(m):
-                    weather_markets.append(m)
-            has_more = (
-                data.get("has_more", False) if isinstance(data, dict)
-                else len(markets) == page_size
-            )
-            if not has_more:
-                break
-            offset += page_size
-        log.info(f"  ✅ [L3] {len(weather_markets)} marchés météo")
-        return weather_markets
-
-    def get_weather_markets(self, target: int = 500) -> list:
+    def get_weather_markets(self, target: int = 400) -> list:
         log.info(f"🌦️  Récupération marchés météo (target={target})…")
         all_markets: list = []
         seen_ids:    set  = set()
@@ -721,17 +703,38 @@ class PolymarketClient:
                     seen_ids.add(mid)
                     all_markets.append(m)
 
+        # Couche 1 : tag_id weather
         tag_id = self._discover_weather_tag_id()
         if tag_id:
-            _add(self._fetch_events_by_weather_tag(tag_id, limit=target))
+            _add(self._paginate_events(
+                {"tag_id": tag_id, "related_tags": "true", "active": "true",
+                 "closed": "false", "order": "volume24hr", "ascending": "false",
+                 "limit": 50},
+                label="gamma/L1_tag", max_markets=target,
+            ))
 
+        # Couche 2 : filtre textuel sur tous les events actifs
         if len(all_markets) < target:
+            batch = self._paginate_events(
+                {"active": "true", "closed": "false",
+                 "order": "volume24hr", "ascending": "false", "limit": 100},
+                label="gamma/L2_all", max_markets=2000,
+            )
             before = len(all_markets)
-            _add(self._fetch_events_textual_filter(limit=target))
-            log.info(f"  +{len(all_markets)-before} via L2 → {len(all_markets)} total")
+            _add([m for m in batch if _is_weather_market(m)])
+            log.info(f"  L2 +{len(all_markets)-before} → {len(all_markets)} total")
 
+        # Couche 3 : /markets direct (fallback)
         if len(all_markets) == 0:
-            _add(self._fetch_markets_direct_filter(limit=target))
+            data = safe_api_call(
+                self.session, "GET", f"{GAMMA_BASE}/markets",
+                label="gamma/L3_direct",
+                params={"active": "true", "closed": "false",
+                        "order": "volume24hr", "ascending": "false", "limit": 100},
+            )
+            if data:
+                mkts = data if isinstance(data, list) else data.get("data", [])
+                _add([m for m in mkts if _is_weather_market(m)])
 
         all_markets.sort(key=_market_priority, reverse=True)
         city_matches = sum(1 for m in all_markets if _market_city(m))
@@ -741,16 +744,16 @@ class PolymarketClient:
     def place_order(self, token_id: str, price: float,
                     size: float, side: str = "BUY") -> dict | None:
         if not self.account:
-            log.info(f"[SIMULATION] {side} {size:.2f} USDC @ {price:.3f} token={token_id[:12]}…")
+            log.info(f"  [SIM] {side} {size:.2f}$ @ {price:.3f} {token_id[:10]}…")
             return {"status": "simulated", "token_id": token_id,
                     "price": price, "size": size}
         try:
             order = {
                 "orderType": "GTC", "tokenID": token_id, "side": side,
-                "price":     str(round(price, 4)), "size": str(round(size, 2)),
-                "funder":    self.address, "maker": self.address, "expiration": "0",
+                "price": str(round(price, 4)), "size": str(round(size, 2)),
+                "funder": self.address, "maker": self.address, "expiration": "0",
             }
-            log.info(f"[ORDRE] {side} {size:.2f} USDC @ {price:.3f}")
+            log.info(f"  [ORDRE] {side} {size:.2f}$ @ {price:.3f}")
             return order
         except Exception as e:
             log.error(f"Erreur place_order: {e}")
@@ -759,42 +762,31 @@ class PolymarketClient:
     def get_redeemable_positions(self) -> list:
         if not self.address:
             return []
-        log.info("  🔍 Positions redeemables…")
         all_pos = safe_api_call(
             self.session, "GET", f"{DATA_BASE}/positions",
             label="data/positions",
             params={"user": self.address, "sizeThreshold": "0"},
         )
         if all_pos is not None:
-            positions  = all_pos if isinstance(all_pos, list) else all_pos.get("data", [])
-            redeemable = [
-                p for p in positions
-                if p.get("redeemable") is True and _safe_float(p.get("size")) > 0
-            ]
-            log.info(f"  📊 {len(positions)} positions, {len(redeemable)} redeemables")
-            return redeemable
+            positions = all_pos if isinstance(all_pos, list) else all_pos.get("data", [])
+            return [p for p in positions
+                    if p.get("redeemable") is True and _safe_float(p.get("size")) > 0]
         activity = safe_api_call(
             self.session, "GET", f"{DATA_BASE}/activity",
-            label="data/activity_fallback",
+            label="data/activity",
             params={"user": self.address, "type": "REDEEM", "limit": "50"},
         )
-        if activity is None:
+        if not activity:
             return []
         acts = activity if isinstance(activity, list) else activity.get("data", [])
-        return [
-            {
-                "conditionId": a.get("conditionId", ""),
-                "redeemable":  True,
-                "cashPnl":     _safe_float(a.get("usdcSize"), 0.0),
-                "title":       a.get("title", "?"),
-                "market":      {"question": a.get("title", "?")},
-            }
-            for a in acts
-        ]
+        return [{"conditionId": a.get("conditionId", ""), "redeemable": True,
+                 "cashPnl": _safe_float(a.get("usdcSize")),
+                 "title": a.get("title", "?"),
+                 "market": {"question": a.get("title", "?")}} for a in acts]
 
     def redeem_position(self, condition_id: str, outcome_index: int = 0) -> bool:
         if not self.account:
-            log.info(f"[SIMULATION] Redeem {condition_id[:12]}…")
+            log.info(f"  [SIM] Redeem {condition_id[:12]}…")
             return True
         if not self.w3:
             return True
@@ -810,8 +802,7 @@ class PolymarketClient:
                 "outputs": [], "stateMutability": "nonpayable",
             }]
             ctf = self.w3.eth.contract(
-                address=self.w3.to_checksum_address(CTF_ADDRESS), abi=ctf_abi
-            )
+                address=self.w3.to_checksum_address(CTF_ADDRESS), abi=ctf_abi)
             tx = ctf.functions.redeemPositions(
                 self.w3.to_checksum_address(USDC_ADDRESS),
                 bytes.fromhex(HASH_ZERO[2:]),
@@ -826,11 +817,9 @@ class PolymarketClient:
             signed  = self.w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            if receipt.status == 1:
-                log.info(f"  ✅ Redeem OK tx={tx_hash.hex()[:20]}…")
-                return True
-            log.error(f"  ❌ Redeem FAILED tx={tx_hash.hex()[:20]}…")
-            return False
+            ok = receipt.status == 1
+            log.info(f"  {'✅' if ok else '❌'} Redeem {condition_id[:12]} tx={tx_hash.hex()[:16]}…")
+            return ok
         except Exception as e:
             log.error(f"Erreur redeem {condition_id[:12]}: {e}")
             return False
@@ -845,7 +834,6 @@ def compute_ev(prob_model: float, market_price: float) -> float:
 
 def temperature_to_prob(forecast_temp: float, bin_low: float,
                         bin_high: float, spread: float) -> float:
-    import math
     sigma = max(spread, 1.0) * 1.5
     mu    = forecast_temp
     def cdf(x):
@@ -889,11 +877,9 @@ def select_bins(market: dict, forecast: dict) -> list:
             except Exception:
                 clob_ids = []
         outcomes = [
-            {
-                "title":        outcomes[i],
-                "price":        prices_raw[i] if i < len(prices_raw) else "0.5",
-                "clobTokenIds": [clob_ids[i]] if i < len(clob_ids) else [""],
-            }
+            {"title":        outcomes[i],
+             "price":        prices_raw[i] if i < len(prices_raw) else "0.5",
+             "clobTokenIds": [clob_ids[i]] if i < len(clob_ids) else [""]}
             for i in range(len(outcomes))
         ]
 
@@ -903,24 +889,21 @@ def select_bins(market: dict, forecast: dict) -> list:
     result    = []
 
     for outcome in outcomes:
-        title             = outcome.get("title", "") if isinstance(outcome, dict) else str(outcome)
-        bin_low, bin_high = parse_temp_range(title)
-        if bin_low is None or bin_high is None:
+        title         = outcome.get("title", "") if isinstance(outcome, dict) else str(outcome)
+        bl, bh        = parse_temp_range(title)
+        if bl is None or bh is None:
             continue
-        market_price = _safe_float(outcome.get("price", 0.5), 0.5)
-        if market_price <= 0 or market_price >= 1:
+        mp = _safe_float(outcome.get("price", 0.5), 0.5)
+        if mp <= 0 or mp >= 1:
             continue
-        prob = temperature_to_prob(temp, bin_low, bin_high, spread)
-        ev   = compute_ev(prob, market_price)
+        prob = temperature_to_prob(temp, bl, bh, spread)
+        ev   = compute_ev(prob, mp)
         clob = outcome.get("clobTokenIds", [""])
         result.append({
             "token_id":     clob[0] if clob else "",
             "title":        title,
-            "bin_low":      bin_low,
-            "bin_high":     bin_high,
-            "prob":         prob,
-            "market_price": market_price,
-            "ev":           ev,
+            "bin_low":      bl, "bin_high": bh,
+            "prob":         prob, "market_price": mp, "ev": ev,
         })
 
     result.sort(key=lambda x: abs(((x["bin_low"] + x["bin_high"]) / 2) - temp))
@@ -930,17 +913,16 @@ def select_bins(market: dict, forecast: dict) -> list:
 def check_daily_reset(state: dict) -> dict:
     today = datetime.utcnow().strftime("%Y-%m-%d")
     if state["daily_reset"] != today:
-        log.info(f"🌅 Nouveau jour {today} — Reset PnL (était {_fmt(state['daily_pnl'])} USDC)")
+        log.info(f"🌅 Nouveau jour {today} — Reset PnL ({_fmt(state['daily_pnl'])} USDC)")
         state["daily_pnl"]   = 0.0
         state["daily_reset"] = today
     return state
 
 def is_paused(state: dict) -> bool:
     if state.get("paused_until"):
-        pause_end = datetime.fromisoformat(state["paused_until"])
-        if datetime.utcnow() < pause_end:
-            remaining = int((pause_end - datetime.utcnow()).total_seconds() // 60)
-            log.info(f"⏸️  Bot en pause — encore {remaining} min")
+        end = datetime.fromisoformat(state["paused_until"])
+        if datetime.utcnow() < end:
+            log.info(f"⏸️  Pause — encore {int((end-datetime.utcnow()).total_seconds()//60)} min")
             return True
         log.info("▶️  Pause terminée")
         state["paused_until"] = None
@@ -949,78 +931,66 @@ def is_paused(state: dict) -> bool:
 def check_daily_loss(state: dict, balance: float) -> bool:
     loss_pct = -state["daily_pnl"] / balance if balance > 0 else 0
     if loss_pct > DAILY_LOSS_LIMIT:
-        pause_until = (datetime.utcnow() + timedelta(hours=24)).isoformat()
-        state["paused_until"] = pause_until
+        pu = (datetime.utcnow() + timedelta(hours=24)).isoformat()
+        state["paused_until"] = pu
         log.warning(
             f"🛡️  PROTECTION ACTIVÉE — Perte {loss_pct*100:.1f}% > "
-            f"{DAILY_LOSS_LIMIT*100:.0f}% — Pause jusqu'à {pause_until[:16]}"
+            f"{DAILY_LOSS_LIMIT*100:.0f}% — Pause jusqu'à {pu[:16]}"
         )
         return True
     return False
 
 def check_milestones(balance: float, state: dict):
     for m in [500, 1000, 1500, 2000]:
-        label = str(m)
-        if balance >= m and label not in state.get("milestones_hit", []):
-            state.setdefault("milestones_hit", []).append(label)
-            log.info(f"🎉 Capital ≥ {m} USDC ({_fmt(balance)} USDC) — La tirelire grossit 💰")
+        lbl = str(m)
+        if balance >= m and lbl not in state.get("milestones_hit", []):
+            state.setdefault("milestones_hit", []).append(lbl)
+            log.info(f"🎉 Capital ≥ {m} USDC ({_fmt(balance)}) — La tirelire grossit 💰")
 
 # ── Redeem automatique ─────────────────────────────────────────────────────────
 def auto_redeem(client: PolymarketClient, state: dict, cal: dict) -> float:
-    total_redeemed = 0.0
+    total = 0.0
     try:
         resolved = client.get_redeemable_positions()
         if not resolved:
             return 0.0
         log.info(f"💎 {len(resolved)} position(s) redeemable(s)")
         for pos in resolved:
-            condition_id  = pos.get("conditionId", "")
-            pnl           = _safe_float(pos.get("cashPnl") or pos.get("pnl"), 0.0)
-            market_name   = pos.get("title") or pos.get("market", {}).get("question", "?")
-            city_hint     = next(
+            cid   = pos.get("conditionId", "")
+            pnl   = _safe_float(pos.get("cashPnl") or pos.get("pnl"))
+            mname = pos.get("title") or pos.get("market", {}).get("question", "?")
+            city_hint = next(
                 (c["name"] for c in CITIES
-                 if any(alias in str(market_name).lower() for alias in c["aliases"])),
+                 if any(a in str(mname).lower() for a in c["aliases"])),
                 "Unknown",
             )
-            outcome_index = int(_safe_float(pos.get("outcomeIndex"), 0))
-            if client.redeem_position(condition_id, outcome_index):
-                total_redeemed += pnl
+            oi = int(_safe_float(pos.get("outcomeIndex")))
+            if client.redeem_position(cid, oi):
+                total += pnl
                 update_calibration(city_hint, datetime.utcnow().month, cal, pnl > 0)
                 append_trade({
                     "timestamp":     datetime.utcnow().isoformat(),
-                    "market":        str(market_name)[:50],
+                    "market":        str(mname)[:50],
                     "bins":          "REDEEM",
                     "amount":        0,
                     "entry_price":   "",
                     "exit_price":    "",
                     "pnl":           round(pnl, 4),
-                    "balance_after": round(state["balance"] + total_redeemed, 2),
+                    "balance_after": round(state["balance"] + total, 2),
                     "ev":            "",
-                    "notes":         f"Auto-redeem conditionId={condition_id[:12]}",
+                    "notes":         f"Auto-redeem {cid[:12]}",
                 })
-                log.info(f"  ✅ Redeem {str(market_name)[:30]} → PnL {pnl:+.2f} USDC")
+                log.info(f"  ✅ Redeem {str(mname)[:30]} PnL={pnl:+.2f}$")
     except Exception as e:
         log.error(f"Erreur auto_redeem: {e}")
-    return total_redeemed
+    return total
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── process_city_markets ──────────────────────────────────────────────────────
-# Traite UNE ville avec son consensus pré-calculé contre tous ses marchés.
-# Retourne le nombre d'ordres placés.
-# ══════════════════════════════════════════════════════════════════════════════
-def process_city_markets(
-    city: dict,
-    forecast: dict,
-    city_markets: list,
-    client: PolymarketClient,
-    state: dict,
-    cal: dict,
-) -> int:
+# ── Traitement d'une ville ─────────────────────────────────────────────────────
+def process_city(city: dict, forecast: dict, city_markets: list,
+                 client: PolymarketClient, state: dict, cal: dict) -> int:
     """
-    Pour une ville donnée :
-    - Utilise le forecast déjà calculé (pas de double appel météo)
-    - Parcourt tous les marchés de cette ville
-    - Place les ordres qui passent les filtres EV + MIN_BINS
+    1 forecast pré-calculé × N marchés de la ville.
+    Retourne le nombre d'ordres placés.
     """
     trades = 0
     month  = datetime.utcnow().month
@@ -1028,87 +998,75 @@ def process_city_markets(
 
     for market in city_markets:
         try:
-            selected_bins = select_bins(market, forecast)
+            bins = select_bins(market, forecast)
         except Exception as e:
-            log.error(f"    select_bins error: {e}")
+            log.error(f"    select_bins: {e}")
             continue
-
-        if len(selected_bins) < MIN_BINS:
+        if len(bins) < MIN_BINS:
             continue
 
         total_bet = compute_bet_size(state["balance"])
-        total_ev  = sum(b["ev"] for b in selected_bins)
-        mname     = (
-            market.get("question") or
-            market.get("title") or
-            market.get("slug", "?")
-        )[:50]
-
+        total_ev  = sum(b["ev"] for b in bins)
+        mname     = (market.get("question") or market.get("title")
+                     or market.get("slug", "?"))[:50]
         log.info(f"    🎯 {mname}")
 
-        for b in selected_bins:
+        for b in bins:
             if total_ev <= 0:
                 break
-            bin_bet = round((b["ev"] / total_ev) * total_bet * conf, 2)
-            if bin_bet < 0.50:
+            bb = round((b["ev"] / total_ev) * total_bet * conf, 2)
+            if bb < 0.50:
                 continue
-            result = client.place_order(
-                token_id=b["token_id"],
-                price=b["market_price"],
-                size=bin_bet,
-            )
+            result = client.place_order(b["token_id"], b["market_price"], bb)
             if result:
-                trades              += 1
-                state["balance"]    -= bin_bet
-                state["daily_pnl"] -= bin_bet
+                trades             += 1
+                state["balance"]   -= bb
+                state["daily_pnl"] -= bb
                 append_trade({
                     "timestamp":     datetime.utcnow().isoformat(),
                     "market":        mname,
                     "bins":          b["title"],
-                    "amount":        bin_bet,
+                    "amount":        bb,
                     "entry_price":   b["market_price"],
                     "exit_price":    "",
                     "pnl":           "",
                     "balance_after": round(state["balance"], 2),
                     "ev":            b["ev"],
-                    "notes":         (
+                    "notes": (
                         f"Consensus={forecast['consensus']} "
                         f"Spread={_fmt(forecast['spread'])} "
-                        f"Conf={conf} "
-                        f"EV≥{forecast['ev_threshold']*100:.0f}% "
+                        f"Conf={conf} EV≥{forecast['ev_threshold']*100:.0f}% "
                         f"Models={forecast['models']}"
                     ),
                 })
                 log.info(
-                    f"      ✅ [{b['title']}] {bin_bet:.2f} USDC "
-                    f"@ {b['market_price']:.3f} EV={b['ev']:.1%}"
+                    f"      ✅ [{b['title']}] {bb:.2f}$ @ {b['market_price']:.3f} "
+                    f"EV={b['ev']:.1%}"
                 )
     return trades
 
 # ── Boucle principale ──────────────────────────────────────────────────────────
 def run():
-    log.info("🌤️  Tirelire Météo Pension v1.8 démarrée — Ultra-safe mode")
-    log.info(f"📂 Données : {DATA_DIR}")
-    log.info(f"⏱️  Scan toutes les {SCAN_INTERVAL//60} min")
+    log.info("🌤️  Tirelire Météo Pension v1.9 démarrée")
+    log.info(f"📂 {DATA_DIR} | ⏱️  {SCAN_INTERVAL//60} min/cycle")
     log.info(
-        f"🌡️  Sources : GFS + ECMWF"
-        + (" + NOAA API" if NOAA_API_TOKEN else " [NOAA désactivé]")
+        f"🌡️  GFS + ECMWF"
+        + (" + NOAA" if NOAA_API_TOKEN else " [NOAA off]")
     )
     log.info(
-        f"📈 EV seuils : {EV_THRESHOLD*100:.0f}% défaut "
-        f"/ {EV_THRESHOLD_STRONG*100:.0f}% (3 sources STRONG)"
+        f"📈 EV {EV_THRESHOLD*100:.0f}% / {EV_THRESHOLD_STRONG*100:.0f}% (3src STRONG) | "
+        f"🏙️  {CITIES_PER_CYCLE} villes/cycle | ⏳ {INTER_CITY_DELAY}s inter-ville"
     )
-    log.info(f"⏳ Délai inter-ville : {INTER_CITY_DELAY}s")
-    log.info(f"🏙️  Villes ({len(CITIES)}) : {', '.join(c['name'] for c in CITIES)}")
 
     init_csv()
-    state  = load_state()
-    cal    = load_calibration()
-    client = PolymarketClient()
+    state    = load_state()
+    cal      = load_calibration()
+    client   = PolymarketClient()
+    rotation = CityRotation(CITIES, per_cycle=CITIES_PER_CYCLE)
 
     cycle = 0
     while True:
-        cycle += 1
+        cycle      += 1
         cycle_start = time.time()
         log.info(f"\n{'═'*60}")
         log.info(f"🔄 Cycle #{cycle} — Balance: {_fmt(state['balance'])} USDC")
@@ -1117,10 +1075,10 @@ def run():
         check_milestones(state["balance"], state)
 
         redeemed = auto_redeem(client, state, cal)
-        if redeemed != 0:
+        if redeemed:
             state["balance"]   += redeemed
             state["daily_pnl"] += redeemed
-            log.info(f"💰 Redeemed: {redeemed:+.2f} USDC → {_fmt(state['balance'])} USDC")
+            log.info(f"💰 +{redeemed:.2f}$ redeemed → {_fmt(state['balance'])} USDC")
 
         if is_paused(state):
             save_state(state)
@@ -1131,111 +1089,87 @@ def run():
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # ── Récupération des marchés météo ──────────────────────────────────
-        markets = client.get_weather_markets(target=500)
+        # ── Récupération marchés ────────────────────────────────────────────
+        markets = client.get_weather_markets(target=400)
         log.info(f"📊 {len(markets)} marchés météo récupérés")
 
-        # ── Regroupement des marchés par ville ──────────────────────────────
-        # Structure : {city_name: [market, market, …]}
+        # ── Regroupement par ville ──────────────────────────────────────────
         markets_by_city: dict[str, list] = {}
-        unmatched = 0
-        for market in markets:
-            city = _market_city(market)
-            if city is None:
-                unmatched += 1
-                continue
-            markets_by_city.setdefault(city["name"], []).append(market)
+        for m in markets:
+            city = _market_city(m)
+            if city:
+                markets_by_city.setdefault(city["name"], []).append(m)
 
-        log.info(
-            f"📍 Marchés groupés : "
-            + ", ".join(
-                f"{cname}={len(mlist)}"
-                for cname, mlist in sorted(
-                    markets_by_city.items(),
-                    key=lambda kv: next(
-                        (c["priority"] for c in CITIES if c["name"] == kv[0]), 0
-                    ),
-                    reverse=True,
-                )
+        available = set(markets_by_city.keys())
+        if available:
+            log.info(
+                "📍 Villes disponibles : "
+                + ", ".join(f"{n}({len(markets_by_city[n])})" for n in sorted(available))
             )
-            + (f" | sans ville={unmatched}" if unmatched else "")
-        )
+        else:
+            log.warning("  ⚠️  Aucune ville reconnue dans les marchés ce cycle")
+            save_state(state)
+            time.sleep(max(10, SCAN_INTERVAL - (time.time() - cycle_start)))
+            continue
 
-        # ── Traitement ville par ville, une seule fois par cycle ───────────
-        # Ordre : CITIES[] (priorité décroissante)
-        # Pour chaque ville : 1 appel consensus météo → N marchés
-        # Délai INTER_CITY_DELAY entre chaque ville
-        trades_this_cycle = 0
-        cities_analysed   = 0
-        cities_skipped    = 0
+        # ── Sélection des villes par rotation équitable ────────────────────
+        selected_cities = rotation.select(available)
 
-        for city in CITIES:
-            city_name    = city["name"]
-            city_markets = markets_by_city.get(city_name, [])
+        # ── Analyse et trading ville par ville ─────────────────────────────
+        trades_total    = 0
+        cities_ok       = 0
+        cities_skipped  = 0
 
-            if not city_markets:
-                # Pas de marché Polymarket actif pour cette ville → skip silencieux
-                continue
+        for i, city in enumerate(selected_cities, start=1):
+            cname        = city["name"]
+            city_markets = markets_by_city.get(cname, [])
 
-            # ── 1 consensus météo par ville par cycle ──────────────────────
-            log.info(f"\n  🏙️  {city_name} ({len(city_markets)} marché(s))")
+            log.info(
+                f"\n  [{i}/{len(selected_cities)}] 🏙️  {cname} "
+                f"— {len(city_markets)} marché(s)"
+            )
+
+            # 1 seul appel consensus météo par ville par cycle
             try:
                 forecast = build_consensus_forecast(city)
             except Exception as e:
-                log.error(f"    build_consensus_forecast({city_name}): {e}")
-                continue
+                log.error(f"    forecast error: {e}")
+                forecast = None
 
             if forecast is None:
-                log.info(f"    ⏭️  {city_name} : pas assez de sources météo — skip")
+                log.info(f"    ⏭️  {cname} : sources météo insuffisantes")
                 cities_skipped += 1
-                # Délai quand même pour ne pas enchaîner trop vite
-                time.sleep(INTER_CITY_DELAY)
-                continue
-
-            if forecast["consensus"] == "WEAK":
+            elif forecast["consensus"] == "WEAK":
                 log.info(
-                    f"    ⏭️  {city_name} : consensus WEAK "
-                    f"(spread={_fmt(forecast['spread'])}°C) — skip"
+                    f"    ⏭️  {cname} : consensus WEAK "
+                    f"(spread={_fmt(forecast['spread'])}°C)"
                 )
                 cities_skipped += 1
-                time.sleep(INTER_CITY_DELAY)
-                continue
-
-            if forecast["sources"] < 2:
-                log.info(f"    ⏭️  {city_name} : {forecast['sources']} source(s) — skip")
+            elif forecast["sources"] < 2:
+                log.info(f"    ⏭️  {cname} : {forecast['sources']} source(s) — skip")
                 cities_skipped += 1
+            else:
+                n = process_city(city, forecast, city_markets, client, state, cal)
+                trades_total  += n
+                cities_ok     += 1
+                log.info(f"    → {n} ordre(s) | Balance: {_fmt(state['balance'])} USDC")
+                if n > 0:
+                    save_state(state)
+
+            # Délai entre villes (sauf après la dernière)
+            if i < len(selected_cities):
                 time.sleep(INTER_CITY_DELAY)
-                continue
 
-            # ── Trading sur les marchés de cette ville ─────────────────────
-            n = process_city_markets(city, forecast, city_markets, client, state, cal)
-            trades_this_cycle += n
-            cities_analysed   += 1
-
-            log.info(
-                f"    → {n} ordre(s) | "
-                f"Balance: {_fmt(state['balance'])} USDC"
-            )
-
-            # Sauvegarde intermédiaire après chaque ville tradée
-            if n > 0:
-                save_state(state)
-
-            # ── Délai entre villes : respecte Open-Meteo + logs lisibles ──
-            time.sleep(INTER_CITY_DELAY)
-
-        # ── Résumé du cycle ─────────────────────────────────────────────────
+        # ── Résumé cycle ────────────────────────────────────────────────────
         elapsed = time.time() - cycle_start
         log.info(f"\n{'─'*60}")
         log.info(
-            f"✔️  Cycle #{cycle} terminé en {elapsed:.0f}s — "
-            f"{trades_this_cycle} ordres | "
-            f"{cities_analysed} villes analysées | "
-            f"{cities_skipped} skippées"
+            f"✔️  Cycle #{cycle} | {elapsed:.0f}s | "
+            f"{trades_total} ordres | "
+            f"{cities_ok} villes OK | {cities_skipped} skippées"
         )
         save_state(state)
 
-        # ── Pause jusqu'au prochain cycle ───────────────────────────────────
         next_wait = max(10, SCAN_INTERVAL - elapsed)
         log.info(f"😴 Prochain cycle dans {next_wait:.0f}s…")
         time.sleep(next_wait)
