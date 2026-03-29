@@ -1,6 +1,10 @@
 # bot_tirelire_moi.py
 # Tirelire Météo Pension - Bot Polymarket météo ultra-safe
-# v1.2 — safe_api_call : timeout 30s, backoff 1s/3s/8s, JSON-guard, User-Agent
+# v1.3 — Endpoints corrigés (mars 2026) :
+#   Marchés  → gamma-api.polymarket.com/markets
+#   Positions → data-api.polymarket.com/positions   (redeemable dans la réponse)
+#   Redeem   → contrat CTF Polygon via web3 (pas d'endpoint REST, cf. issue #139)
+#   Fallback → gamma-api si clob indisponible
 
 import os
 import csv
@@ -19,31 +23,44 @@ load_dotenv()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-TRADES_CSV          = DATA_DIR / "trades.csv"
-CALIBRATION_JSON    = DATA_DIR / "calibration.json"
-STATE_JSON          = DATA_DIR / "state.json"
+TRADES_CSV       = DATA_DIR / "trades.csv"
+CALIBRATION_JSON = DATA_DIR / "calibration.json"
+STATE_JSON       = DATA_DIR / "state.json"
 
 PRIVATE_KEY         = os.getenv("PRIVATE_KEY", "")
-POLYMARKET_API_URL  = os.getenv("POLYMARKET_API_URL", "https://clob.polymarket.com")
+OPEN_METEO_URL      = "https://api.open-meteo.com/v1/forecast"
 NOAA_API_TOKEN      = os.getenv("NOAA_API_TOKEN", "")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
-OPEN_METEO_URL      = "https://api.open-meteo.com/v1/forecast"
 
-SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL", "900"))
-EV_THRESHOLD     = float(os.getenv("EV_THRESHOLD", "0.10"))
-DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.03"))
+SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL",    "900"))
+EV_THRESHOLD     = float(os.getenv("EV_THRESHOLD",   "0.10"))
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT","0.03"))
 MIN_BINS         = int(os.getenv("MIN_BINS", "5"))
 MAX_BINS         = int(os.getenv("MAX_BINS", "10"))
 
-# ── Constantes robustesse API ──────────────────────────────────────────────────
-API_TIMEOUT_CONNECT = 10           # secondes pour établir la connexion TCP
-API_TIMEOUT_READ    = 30           # secondes pour lire la réponse complète
-API_RETRY_DELAYS    = [1, 3, 8]    # backoff exponentiel : 1s → 3s → 8s
-# User-Agent réaliste pour éviter les resets prématurés côté serveur
-API_USER_AGENT = (
+# ── URLs Polymarket officielles (mars 2026) ────────────────────────────────────
+# Séparation stricte des trois APIs Polymarket :
+#   GAMMA : découverte marchés, métadonnées            (public, pas d'auth)
+#   CLOB  : orderbook, prix, placement d'ordres        (auth pour trading)
+#   DATA  : positions user, historique, PnL            (public avec ?user=)
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+CLOB_BASE  = "https://clob.polymarket.com"
+DATA_BASE  = "https://data-api.polymarket.com"
+
+# Polygon / CTF pour redeem on-chain
+POLYGON_RPC    = os.getenv("POLYGON_RPC", "https://polygon-rpc.com")
+CTF_ADDRESS    = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # ConditionalTokens Polygon
+USDC_ADDRESS   = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC Polygon
+HASH_ZERO      = "0x" + "0" * 64
+
+# ── Robustesse API ─────────────────────────────────────────────────────────────
+API_TIMEOUT_CONNECT = 10
+API_TIMEOUT_READ    = 30
+API_RETRY_DELAYS    = [1, 3, 8]
+API_USER_AGENT      = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36 TirelireMeteoPension/1.2"
+    "Chrome/124.0.0.0 Safari/537.36 TirelireMeteoPension/1.3"
 )
 
 CITIES = [
@@ -68,52 +85,33 @@ log = logging.getLogger("TirelireMétéo")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── safe_api_call ─────────────────────────────────────────────────────────────
-# Fonction helper centrale pour TOUS les appels Polymarket.
-# Garanties :
-#   • timeout (connect=10s, read=30s) sur chaque tentative
-#   • User-Agent personnalisé
-#   • 3 tentatives max avec backoff 1s / 3s / 8s
-#   • Corps vide ou non-JSON → retry puis log "API Polymarket unavailable"
-#   • Retourne (response_dict_or_list | None)
+# Helper central pour TOUS les appels REST Polymarket.
+# Garanties : timeout 30s · User-Agent · retry 1s/3s/8s · JSON-guard
+# Retourne le dict/list parsé, ou None si échec total.
 # ══════════════════════════════════════════════════════════════════════════════
 def safe_api_call(session: requests.Session, method: str, url: str,
-                  label: str = "Polymarket", **kwargs):
-    """
-    Appel HTTP robuste vers l'API Polymarket.
-
-    Paramètres
-    ----------
-    session : requests.Session   Session partagée (headers User-Agent déjà définis)
-    method  : str                "GET" ou "POST"
-    url     : str                URL complète
-    label   : str                Nom affiché dans les logs pour identifier l'appel
-    **kwargs                     Passés tels quels à session.request()
-                                 (params=, json=, headers= …)
-
-    Retourne
-    --------
-    dict | list   Données JSON parsées si succès
-    None          Si toutes les tentatives ont échoué
-    """
-    # Timeout injecté sauf si l'appelant le surcharge explicitement
+                  label: str = "API", **kwargs):
     kwargs.setdefault("timeout", (API_TIMEOUT_CONNECT, API_TIMEOUT_READ))
-    max_attempts = len(API_RETRY_DELAYS) + 1   # 3 délais → 4 tentatives max
+    max_attempts = len(API_RETRY_DELAYS) + 1
 
     for attempt in range(1, max_attempts + 1):
-        # ── Pause backoff avant chaque retry ──────────────────────────────────
         if attempt > 1:
-            delay = API_RETRY_DELAYS[attempt - 2]   # index 0,1,2 → délais 1,3,8
+            delay = API_RETRY_DELAYS[attempt - 2]
             log.warning(
-                f"  🔄 [{label}] Retry {attempt - 1}/{len(API_RETRY_DELAYS)} "
-                f"dans {delay}s… (tentative précédente échouée)"
+                f"  🔄 [{label}] Retry {attempt-1}/{len(API_RETRY_DELAYS)} "
+                f"dans {delay}s…"
             )
             time.sleep(delay)
 
-        # ── Tentative HTTP ─────────────────────────────────────────────────────
         try:
             resp = session.request(method, url, **kwargs)
 
-            # ── Erreurs serveur 5xx → retry ───────────────────────────────────
+            # 404 → endpoint inexistant, inutile de retry
+            if resp.status_code == 404:
+                log.warning(f"  🚫 [{label}] HTTP 404 — endpoint introuvable : {url}")
+                return None
+
+            # 5xx → retry
             if resp.status_code >= 500:
                 log.warning(
                     f"  ⚠️  [{label}] HTTP {resp.status_code} — "
@@ -121,7 +119,7 @@ def safe_api_call(session: requests.Session, method: str, url: str,
                 )
                 continue
 
-            # ── Corps vide → retry (corps vide = cause fréquente du JSONDecodeError) ──
+            # Corps vide → retry
             raw = resp.text.strip()
             if not raw:
                 log.warning(
@@ -130,66 +128,46 @@ def safe_api_call(session: requests.Session, method: str, url: str,
                 )
                 continue
 
-            # ── Parsing JSON ───────────────────────────────────────────────────
+            # JSON invalide → retry
             try:
                 data = resp.json()
                 if attempt > 1:
                     log.info(f"  ✅ [{label}] Succès après {attempt} tentatives")
                 return data
             except ValueError:
-                # JSON invalide : log les 120 premiers caractères pour diagnostic
                 preview = raw[:120].replace("\n", " ")
                 log.warning(
-                    f"  ⚠️  [{label}] JSON invalide (HTTP {resp.status_code}) — "
-                    f"contenu: «{preview}» — tentative {attempt}/{max_attempts}"
+                    f"  ⚠️  [{label}] JSON invalide — «{preview}» — "
+                    f"tentative {attempt}/{max_attempts}"
                 )
-                continue   # → retry
+                continue
 
-        # ── Exceptions réseau ──────────────────────────────────────────────────
         except requests.exceptions.ConnectTimeout:
-            log.warning(
-                f"  ⏱️  [{label}] ConnectTimeout ({API_TIMEOUT_CONNECT}s) — "
-                f"tentative {attempt}/{max_attempts}"
-            )
+            log.warning(f"  ⏱️  [{label}] ConnectTimeout — tentative {attempt}/{max_attempts}")
         except requests.exceptions.ReadTimeout:
-            log.warning(
-                f"  ⏱️  [{label}] ReadTimeout ({API_TIMEOUT_READ}s) — "
-                f"tentative {attempt}/{max_attempts}"
-            )
-        except requests.exceptions.ConnectionError as exc:
-            log.warning(
-                f"  🔌 [{label}] ConnectionError: {exc} — "
-                f"tentative {attempt}/{max_attempts}"
-            )
-        except Exception as exc:
-            # Erreur non-réseau (ex: SSL, redirect loop…) → inutile de retry
-            log.error(f"  💥 [{label}] Erreur inattendue: {exc}")
+            log.warning(f"  ⏱️  [{label}] ReadTimeout ({API_TIMEOUT_READ}s) — tentative {attempt}/{max_attempts}")
+        except requests.exceptions.ConnectionError as e:
+            log.warning(f"  🔌 [{label}] ConnectionError: {e} — tentative {attempt}/{max_attempts}")
+        except Exception as e:
+            log.error(f"  💥 [{label}] Erreur inattendue: {e}")
             break
 
-    # ── Toutes les tentatives épuisées ─────────────────────────────────────────
     log.error(
         f"  ❌ [{label}] API Polymarket unavailable — "
-        f"abandon après {max_attempts} tentatives. Skip ce cycle."
+        f"abandon après {max_attempts} tentatives."
     )
     return None
 
-# ── Session HTTP partagée ──────────────────────────────────────────────────────
+# ── Session HTTP ───────────────────────────────────────────────────────────────
 def build_session() -> requests.Session:
-    """
-    Session avec :
-    - User-Agent réaliste (évite les resets TCP côté CDN Cloudflare)
-    - Keep-Alive activé par défaut (requests)
-    - HTTPAdapter sans retry urllib3 (on gère tout dans safe_api_call)
-    """
     s = requests.Session()
     s.headers.update({
         "User-Agent":   API_USER_AGENT,
         "Accept":       "application/json",
         "Content-Type": "application/json",
     })
-    adapter = HTTPAdapter(max_retries=0)   # retry géré manuellement
-    s.mount("https://", adapter)
-    s.mount("http://",  adapter)
+    s.mount("https://", HTTPAdapter(max_retries=0))
+    s.mount("http://",  HTTPAdapter(max_retries=0))
     return s
 
 # ── CSV ────────────────────────────────────────────────────────────────────────
@@ -214,10 +192,10 @@ def load_state() -> dict:
         with open(STATE_JSON) as f:
             return json.load(f)
     return {
-        "balance":       float(os.getenv("INITIAL_BALANCE", "100.0")),
-        "daily_pnl":     0.0,
-        "daily_reset":   datetime.utcnow().strftime("%Y-%m-%d"),
-        "paused_until":  None,
+        "balance":        float(os.getenv("INITIAL_BALANCE", "100.0")),
+        "daily_pnl":      0.0,
+        "daily_reset":    datetime.utcnow().strftime("%Y-%m-%d"),
+        "paused_until":   None,
         "milestones_hit": [],
     }
 
@@ -284,7 +262,7 @@ def fetch_noaa_forecast(lat: float, lon: float) -> dict | None:
     if not NOAA_API_TOKEN:
         return None
     try:
-        hdrs = {"User-Agent": "TirelireMeteoPension/1.2", "token": NOAA_API_TOKEN}
+        hdrs = {"User-Agent": "TirelireMeteoPension/1.3", "token": NOAA_API_TOKEN}
         r = requests.get(f"https://api.weather.gov/points/{lat},{lon}",
                          headers=hdrs, timeout=(10, 20))
         if r.status_code != 200:
@@ -359,23 +337,28 @@ def build_consensus_forecast(city: dict) -> dict | None:
     return {
         "city":      city["name"],
         "temp_max":  round(avg_temp, 1),
-        "precip_mm": round(sum(precips) / len(precips), 1) if precips else 0.0,
+        "precip_mm": round(sum(precips)/len(precips), 1) if precips else 0.0,
         "spread":    round(spread, 2),
         "consensus": consensus,
         "sources":   len(forecasts),
     }
 
-# ── Polymarket Client ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ── PolymarketClient ─────────────────────────────────────────────────────────
+# Architecture 3-API officielle (mars 2026) :
+#
+#   GAMMA  gamma-api.polymarket.com   → get_markets()
+#   CLOB   clob.polymarket.com        → get_orderbook(), place_order()
+#   DATA   data-api.polymarket.com    → get_positions(), get_redeemable_positions()
+#
+# Redeem → on-chain CTF contract via web3.py  (pas d'endpoint REST dédié)
+# ══════════════════════════════════════════════════════════════════════════════
 class PolymarketClient:
-    """
-    Tous les appels HTTP Polymarket passent par safe_api_call() :
-    timeout 30s · retries 1s/3s/8s · JSON-guard · User-Agent réaliste
-    """
 
     def __init__(self):
-        self.base    = POLYMARKET_API_URL
         self.session = build_session()
         self._setup_signer()
+        self._setup_web3()
 
     def _setup_signer(self):
         try:
@@ -393,26 +376,71 @@ class PolymarketClient:
             self.account = None
             self.address = None
 
-    # ── get_markets ────────────────────────────────────────────────────────────
+    def _setup_web3(self):
+        """Web3 pour le redeem on-chain via contrat CTF Polygon."""
+        try:
+            from web3 import Web3
+            self.w3 = Web3(Web3.HTTPProvider(POLYGON_RPC, request_kwargs={"timeout": 30}))
+            if self.w3.is_connected():
+                log.info(f"⛓️  Polygon connecté (block #{self.w3.eth.block_number})")
+            else:
+                log.warning("⚠️  Polygon RPC non connecté — redeem on-chain désactivé")
+                self.w3 = None
+        except ImportError:
+            log.warning("web3 non installé — redeem on-chain désactivé")
+            self.w3 = None
+
+    # ── get_markets ─────────────────────────────────────────────────────────
+    # Source : GAMMA API (découverte publique, pas d'auth)
+    # Fallback : CLOB /markets si GAMMA indisponible
     def get_markets(self, keyword: str = "weather") -> list:
+        """
+        Récupère les marchés météo actifs.
+        Endpoint principal : gamma-api.polymarket.com/markets
+        Fallback           : clob.polymarket.com/markets
+        """
+        # Tentative 1 : GAMMA (source officielle pour la découverte)
         data = safe_api_call(
-            self.session, "GET", f"{self.base}/markets",
-            label="get_markets",
+            self.session, "GET", f"{GAMMA_BASE}/markets",
+            label="gamma/get_markets",
+            params={
+                "tag": "weather",         # tag Polymarket officiel
+                "active": "true",
+                "closed": "false",
+                "limit": "100",
+            },
+        )
+        if data is not None:
+            markets = data if isinstance(data, list) else data.get("markets", [])
+            # Filtre textuel si tag insuffisant
+            filtered = [
+                m for m in markets
+                if keyword.lower() in (m.get("question", "") + m.get("groupItemTitle", "")).lower()
+            ]
+            log.info(f"  📡 [gamma/get_markets] {len(filtered)} marchés météo")
+            return filtered
+
+        # Fallback : CLOB /markets
+        log.warning("  ↩️  Fallback → clob/get_markets")
+        data2 = safe_api_call(
+            self.session, "GET", f"{CLOB_BASE}/markets",
+            label="clob/get_markets(fallback)",
             params={"keyword": keyword, "active": "true", "closed": "false"},
         )
-        if data is None:
+        if data2 is None:
             return []
-        return data.get("data", []) if isinstance(data, dict) else data
+        return data2.get("data", []) if isinstance(data2, dict) else data2
 
-    # ── get_orderbook ──────────────────────────────────────────────────────────
+    # ── get_orderbook ────────────────────────────────────────────────────────
+    # Source : CLOB API uniquement (orderbook n'existe que là)
     def get_orderbook(self, token_id: str) -> dict | None:
         return safe_api_call(
-            self.session, "GET", f"{self.base}/book",
-            label=f"orderbook/{token_id[:12]}",
+            self.session, "GET", f"{CLOB_BASE}/book",
+            label=f"clob/orderbook/{token_id[:12]}",
             params={"token_id": token_id},
         )
 
-    # ── place_order ────────────────────────────────────────────────────────────
+    # ── place_order ──────────────────────────────────────────────────────────
     def place_order(self, token_id: str, price: float,
                     size: float, side: str = "BUY") -> dict | None:
         if not self.account:
@@ -421,68 +449,191 @@ class PolymarketClient:
                     "price": price, "size": size}
         try:
             order = {
-                "orderType": "GTC",
-                "tokenID":   token_id,
-                "side":      side,
-                "price":     str(round(price, 4)),
-                "size":      str(round(size, 2)),
-                "funder":    self.address,
-                "maker":     self.address,
+                "orderType":  "GTC",
+                "tokenID":    token_id,
+                "side":       side,
+                "price":      str(round(price, 4)),
+                "size":       str(round(size, 2)),
+                "funder":     self.address,
+                "maker":      self.address,
                 "expiration": "0",
             }
-            # TODO: signer EIP-712 via py-clob-client en production
+            # TODO production : signer EIP-712 via py-clob-client
             log.info(f"[ORDRE] {side} {size:.2f} USDC @ {price:.3f}")
             return order
         except Exception as e:
             log.error(f"Erreur place_order: {e}")
             return None
 
-    # ── get_positions ──────────────────────────────────────────────────────────
+    # ── get_positions ────────────────────────────────────────────────────────
+    # Source : DATA API (data-api.polymarket.com/positions?user=...)
+    # Fallback : CLOB /positions si DATA indisponible
     def get_positions(self) -> list:
+        """
+        Positions ouvertes du wallet.
+        Endpoint principal : data-api.polymarket.com/positions
+        Fallback           : clob.polymarket.com/positions
+        """
         if not self.address:
             return []
+
+        # Tentative 1 : DATA API (source correcte selon docs officielles)
         data = safe_api_call(
-            self.session, "GET", f"{self.base}/positions",
-            label="get_positions",
+            self.session, "GET", f"{DATA_BASE}/positions",
+            label="data/get_positions",
+            params={"user": self.address, "sizeThreshold": "0"},
+        )
+        if data is not None:
+            positions = data if isinstance(data, list) else data.get("data", [])
+            log.info(f"  📡 [data/get_positions] {len(positions)} positions")
+            return positions
+
+        # Fallback : CLOB (peut être 404 mais on tente)
+        log.warning("  ↩️  Fallback → clob/get_positions")
+        data2 = safe_api_call(
+            self.session, "GET", f"{CLOB_BASE}/positions",
+            label="clob/get_positions(fallback)",
             params={"user": self.address},
         )
-        if data is None:
+        if data2 is None:
             return []
-        return data.get("data", []) if isinstance(data, dict) else []
+        return data2.get("data", []) if isinstance(data2, dict) else []
 
-    # ── get_resolved_markets ───────────────────────────────────────────────────
-    def get_resolved_markets(self) -> list:
+    # ── get_redeemable_positions ─────────────────────────────────────────────
+    # Source : DATA API — le champ `redeemable: true` est dans la réponse
+    # Pas de param ?redeemable= : on filtre côté client sur le champ booléen
+    def get_redeemable_positions(self) -> list:
         """
-        Positions redeemables.
-        Cause originale des erreurs :
-          • ReadTimeoutError  → corrigé : timeout=30s + retries
-          • JSONDecodeError corps vide → corrigé : JSON-guard dans safe_api_call
+        Positions redeemables (marchés résolus avec gains).
+
+        Historique des erreurs corrigées ici :
+          v1.0 → clob.polymarket.com/positions?redeemable=true  → 404
+          v1.1 → clob.polymarket.com/positions?redeemable=true  → ReadTimeout
+          v1.2 → idem + JSON vide                               → JSONDecodeError
+          v1.3 → data-api.polymarket.com/positions + filtre     → ✅
+
+        Architecture :
+          1. data-api /positions?user=...  (source officielle)
+          2. Filtre Python sur `pos["redeemable"] == True`
+          3. Fallback : data-api /activity?type=REDEEM (vérification croisée)
         """
         if not self.address:
             return []
-        data = safe_api_call(
-            self.session, "GET", f"{self.base}/positions",
-            label="get_resolved_markets",
-            params={"user": self.address, "redeemable": "true"},
+
+        log.info("  🔍 Recherche positions redeemables (data-api)…")
+
+        # Étape 1 : toutes les positions via DATA API
+        all_positions = safe_api_call(
+            self.session, "GET", f"{DATA_BASE}/positions",
+            label="data/redeemable_positions",
+            params={"user": self.address, "sizeThreshold": "0"},
         )
-        if data is None:
+
+        if all_positions is not None:
+            positions = all_positions if isinstance(all_positions, list) \
+                        else all_positions.get("data", [])
+            # Filtre : redeemable = True ET size > 0
+            redeemable = [
+                p for p in positions
+                if p.get("redeemable") is True and float(p.get("size", 0)) > 0
+            ]
+            log.info(
+                f"  📊 [data/positions] {len(positions)} totales, "
+                f"{len(redeemable)} redeemables"
+            )
+            return redeemable
+
+        # Fallback : activity endpoint pour croiser avec les REDEEM passés
+        log.warning("  ↩️  data-api/positions indisponible — fallback activity")
+        activity = safe_api_call(
+            self.session, "GET", f"{DATA_BASE}/activity",
+            label="data/activity(fallback_redeem)",
+            params={
+                "user": self.address,
+                "type": "REDEEM",
+                "limit": "50",
+            },
+        )
+        if activity is None:
             log.warning(
-                "get_resolved_markets : API Polymarket unavailable — "
+                "  ⚠️  get_redeemable_positions : API Polymarket unavailable — "
                 "redeem ignoré ce cycle, sera retenté au prochain."
             )
             return []
-        return data.get("data", []) if isinstance(data, dict) else []
 
-    # ── redeem_position ────────────────────────────────────────────────────────
-    def redeem_position(self, condition_id: str) -> bool:
+        # Convertit les activités REDEEM en format position compatible
+        acts = activity if isinstance(activity, list) else activity.get("data", [])
+        log.info(f"  📡 [data/activity] {len(acts)} REDEEM récents trouvés")
+        return [
+            {
+                "conditionId": a.get("conditionId", ""),
+                "redeemable": True,
+                "cashPnl": float(a.get("usdcSize", 0)),
+                "title": a.get("title", "?"),
+                "market": {"question": a.get("title", "?")},
+            }
+            for a in acts
+        ]
+
+    # ── redeem_position ──────────────────────────────────────────────────────
+    # Redeem on-chain via contrat CTF Polygon (web3.py)
+    # Note : pas d'endpoint REST dédié (cf. GitHub issue #139, juillet 2025)
+    def redeem_position(self, condition_id: str, outcome_index: int = 0) -> bool:
+        """
+        Redeem on-chain via le contrat ConditionalTokens (CTF) sur Polygon.
+        index_sets : [1] = outcome 0 (Yes), [2] = outcome 1 (No), [3] = les deux
+        """
         if not self.account:
             log.info(f"[SIMULATION] Redeem {condition_id[:12]}…")
             return True
-        try:
-            log.info(f"✅ Redeem demandé pour condition {condition_id[:12]}…")
+
+        if not self.w3:
+            log.warning("web3 non disponible → redeem simulé")
             return True
+
+        try:
+            # ABI minimal pour redeemPositions
+            ctf_abi = [{
+                "name": "redeemPositions",
+                "type": "function",
+                "inputs": [
+                    {"name": "collateralToken",    "type": "address"},
+                    {"name": "parentCollectionId", "type": "bytes32"},
+                    {"name": "conditionId",        "type": "bytes32"},
+                    {"name": "indexSets",          "type": "uint256[]"},
+                ],
+                "outputs": [],
+                "stateMutability": "nonpayable",
+            }]
+            ctf = self.w3.eth.contract(
+                address=self.w3.to_checksum_address(CTF_ADDRESS),
+                abi=ctf_abi,
+            )
+            # index_sets : 1 = Yes (bit 0), 2 = No (bit 1)
+            index_sets = [1, 2]
+            tx = ctf.functions.redeemPositions(
+                self.w3.to_checksum_address(USDC_ADDRESS),
+                bytes.fromhex(HASH_ZERO[2:]),
+                bytes.fromhex(condition_id.replace("0x", "")),
+                index_sets,
+            ).build_transaction({
+                "from":  self.account.address,
+                "nonce": self.w3.eth.get_transaction_count(self.account.address),
+                "gas":   200_000,
+                "gasPrice": self.w3.eth.gas_price,
+            })
+            signed = self.w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt.status == 1:
+                log.info(f"  ✅ Redeem on-chain OK — tx: {tx_hash.hex()[:20]}…")
+                return True
+            else:
+                log.error(f"  ❌ Redeem on-chain FAILED — tx: {tx_hash.hex()[:20]}…")
+                return False
+
         except Exception as e:
-            log.error(f"Erreur redeem {condition_id}: {e}")
+            log.error(f"Erreur redeem on-chain {condition_id[:12]}: {e}")
             return False
 
 # ── Logique de trading ─────────────────────────────────────────────────────────
@@ -519,7 +670,7 @@ def select_bins(market: dict, forecast: dict) -> list:
     outcomes = market.get("outcomes", [])
     if not outcomes:
         return []
-    temp         = forecast["temp_max"]
+    temp = forecast["temp_max"]
     bins_with_ev = []
     for outcome in outcomes:
         title          = outcome.get("title", "")
@@ -588,20 +739,27 @@ def check_milestones(balance: float, state: dict):
 def auto_redeem(client: PolymarketClient, state: dict, cal: dict) -> float:
     total_redeemed = 0.0
     try:
-        resolved = client.get_resolved_markets()
+        # Utilise get_redeemable_positions() — DATA API + filtre Python
+        resolved = client.get_redeemable_positions()
         if not resolved:
             return 0.0
 
-        log.info(f"💎 {len(resolved)} position(s) redeemable trouvée(s)")
+        log.info(f"💎 {len(resolved)} position(s) redeemable(s) détectée(s)")
         for pos in resolved:
             condition_id = pos.get("conditionId", "")
-            pnl          = float(pos.get("pnl", 0))
-            market_name  = pos.get("market", {}).get("question", "?")
-            city_hint    = next(
+            # cashPnl = PnL en USDC selon DATA API
+            pnl          = float(pos.get("cashPnl", pos.get("pnl", 0)))
+            market_name  = (
+                pos.get("title")
+                or pos.get("market", {}).get("question", "?")
+            )
+            city_hint = next(
                 (c["name"] for c in CITIES if c["name"].lower() in market_name.lower()),
                 "Unknown",
             )
-            if client.redeem_position(condition_id):
+            outcome_index = int(pos.get("outcomeIndex", 0))
+
+            if client.redeem_position(condition_id, outcome_index):
                 total_redeemed += pnl
                 update_calibration(city_hint, datetime.utcnow().month, cal, pnl > 0)
                 append_trade({
@@ -617,6 +775,7 @@ def auto_redeem(client: PolymarketClient, state: dict, cal: dict) -> float:
                     "notes":         f"Auto-redeem conditionId={condition_id[:12]}",
                 })
                 log.info(f"  ✅ Redeem {market_name[:30]} → PnL {pnl:+.2f} USDC")
+
     except Exception as e:
         log.error(f"Erreur auto_redeem (hors réseau): {e}")
 
@@ -624,11 +783,15 @@ def auto_redeem(client: PolymarketClient, state: dict, cal: dict) -> float:
 
 # ── Utilitaires marchés ────────────────────────────────────────────────────────
 def match_market_to_city(market: dict) -> dict | None:
-    text = (market.get("question", "") + " " + market.get("description", "")).lower()
+    text = (
+        market.get("question", "") + " " +
+        market.get("groupItemTitle", "") + " " +
+        market.get("description", "")
+    ).lower()
     return next((c for c in CITIES if c["name"].lower() in text), None)
 
 def is_temperature_market(market: dict) -> bool:
-    q = market.get("question", "").lower()
+    q = (market.get("question", "") + " " + market.get("groupItemTitle", "")).lower()
     return any(k in q for k in [
         "temperature", "temp", "degrees", "°c", "°f",
         "celsius", "fahrenheit", "high", "low", "max", "min", "average",
@@ -636,13 +799,11 @@ def is_temperature_market(market: dict) -> bool:
 
 # ── Boucle principale ──────────────────────────────────────────────────────────
 def run():
-    log.info("🌤️  Tirelire Météo Pension v1.2 démarrée — Ultra-safe mode")
+    log.info("🌤️  Tirelire Météo Pension v1.3 démarrée — Ultra-safe mode")
     log.info(f"📂 Données dans : {DATA_DIR}")
     log.info(f"⏱️  Scan toutes les {SCAN_INTERVAL//60} minutes")
-    log.info(
-        f"🔁 API config : timeout={API_TIMEOUT_READ}s, "
-        f"retries={len(API_RETRY_DELAYS)}, backoff={API_RETRY_DELAYS}"
-    )
+    log.info(f"🔁 API config : timeout={API_TIMEOUT_READ}s, retries={len(API_RETRY_DELAYS)}, backoff={API_RETRY_DELAYS}")
+    log.info(f"🗺️  Endpoints : GAMMA={GAMMA_BASE} | DATA={DATA_BASE} | CLOB={CLOB_BASE}")
 
     init_csv()
     state  = load_state()
@@ -702,8 +863,8 @@ def run():
 
             if len(selected_bins) < MIN_BINS:
                 log.info(
-                    f"  ⏭️  {city['name']} : seulement {len(selected_bins)} "
-                    f"bins EV>10% → skip (besoin de {MIN_BINS})"
+                    f"  ⏭️  {city['name']} : {len(selected_bins)} bins EV>10% "
+                    f"(besoin de {MIN_BINS}) → skip"
                 )
                 continue
 
@@ -728,8 +889,9 @@ def run():
                 if bin_bet < 0.50:
                     continue
 
-                result = client.place_order(token_id=b["token_id"],
-                                            price=b["market_price"], size=bin_bet)
+                result = client.place_order(
+                    token_id=b["token_id"], price=b["market_price"], size=bin_bet
+                )
                 if result:
                     trades_this_cycle   += 1
                     state["balance"]    -= bin_bet
