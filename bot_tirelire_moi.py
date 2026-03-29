@@ -1,11 +1,7 @@
 # bot_tirelire_moi.py
 # Tirelire Météo Pension - Bot Polymarket météo ultra-safe
-# v1.4 — Découverte marchés météo robuste :
-#   Couche 1 : /tags → découverte automatique du tag_id "weather"
-#   Couche 2 : /events?tag_id=...  (endpoint recommandé, events → markets)
-#   Couche 3 : /events?active=true + filtre textuel météo sur slug/title
-#   Couche 4 : /markets?active=true + filtre textuel (fallback ultime)
-#   Tri final : volume 24h décroissant, villes prioritaires en tête
+# v1.5 — Sources météo : Open-Meteo (GFS+ECMWF blend) + NOAA uniquement
+#         OpenWeatherMap supprimé (erreurs 401 récurrentes)
 
 import os
 import csv
@@ -26,12 +22,14 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 TRADES_CSV       = DATA_DIR / "trades.csv"
 CALIBRATION_JSON = DATA_DIR / "calibration.json"
 STATE_JSON       = DATA_DIR / "state.json"
-TAG_CACHE_JSON   = DATA_DIR / "tag_cache.json"   # cache du tag_id weather
+TAG_CACHE_JSON   = DATA_DIR / "tag_cache.json"
 
-PRIVATE_KEY         = os.getenv("PRIVATE_KEY", "")
-OPEN_METEO_URL      = "https://api.open-meteo.com/v1/forecast"
-NOAA_API_TOKEN      = os.getenv("NOAA_API_TOKEN", "")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+PRIVATE_KEY    = os.getenv("PRIVATE_KEY", "")
+NOAA_API_TOKEN = os.getenv("NOAA_API_TOKEN", "")
+# Open-Meteo : gratuit, sans clé, fusionne GFS + ECMWF + ERA5 en interne
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+# Open-Meteo Historical : pour calibration (gratuit, sans clé)
+OPEN_METEO_HIST_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL",     "900"))
 EV_THRESHOLD     = float(os.getenv("EV_THRESHOLD",    "0.10"))
@@ -39,12 +37,11 @@ DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT","0.03"))
 MIN_BINS         = int(os.getenv("MIN_BINS", "5"))
 MAX_BINS         = int(os.getenv("MAX_BINS", "10"))
 
-# ── URLs Polymarket (mars 2026) ────────────────────────────────────────────────
+# ── URLs Polymarket ────────────────────────────────────────────────────────────
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE  = "https://clob.polymarket.com"
 DATA_BASE  = "https://data-api.polymarket.com"
 
-# Polygon / CTF
 POLYGON_RPC  = os.getenv("POLYGON_RPC", "https://polygon-rpc.com")
 CTF_ADDRESS  = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
@@ -57,40 +54,39 @@ API_RETRY_DELAYS    = [1, 3, 8]
 API_USER_AGENT      = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36 TirelireMeteoPension/1.4"
+    "Chrome/124.0.0.0 Safari/537.36 TirelireMeteoPension/1.5"
 )
 
-# ── Villes surveillées (lat/lon + variantes de noms pour le filtre textuel) ───
+# ── Villes surveillées ────────────────────────────────────────────────────────
 CITIES = [
-    {"name": "New York",     "lat": 40.71, "lon": -74.00,
+    {"name": "New York",    "lat": 40.71, "lon": -74.00,
      "aliases": ["new york", "nyc", "ny ", "new-york", "manhattan"]},
-    {"name": "London",       "lat": 51.51, "lon":  -0.13,
+    {"name": "London",      "lat": 51.51, "lon":  -0.13,
      "aliases": ["london", "uk temperature", "england weather"]},
-    {"name": "Chicago",      "lat": 41.88, "lon": -87.63,
+    {"name": "Chicago",     "lat": 41.88, "lon": -87.63,
      "aliases": ["chicago", "chi "]},
-    {"name": "Paris",        "lat": 48.85, "lon":   2.35,
+    {"name": "Paris",       "lat": 48.85, "lon":   2.35,
      "aliases": ["paris", "france temperature"]},
-    {"name": "Los Angeles",  "lat": 34.05, "lon": -118.24,
+    {"name": "Los Angeles", "lat": 34.05, "lon": -118.24,
      "aliases": ["los angeles", "la ", "l.a.", "los-angeles"]},
-    {"name": "Miami",        "lat": 25.76, "lon":  -80.19,
+    {"name": "Miami",       "lat": 25.76, "lon":  -80.19,
      "aliases": ["miami"]},
-    {"name": "Dallas",       "lat": 32.78, "lon":  -96.80,
+    {"name": "Dallas",      "lat": 32.78, "lon":  -96.80,
      "aliases": ["dallas", "dfw"]},
-    {"name": "Seattle",      "lat": 47.61, "lon": -122.33,
+    {"name": "Seattle",     "lat": 47.61, "lon": -122.33,
      "aliases": ["seattle"]},
-    {"name": "Boston",       "lat": 42.36, "lon":  -71.06,
+    {"name": "Boston",      "lat": 42.36, "lon":  -71.06,
      "aliases": ["boston"]},
-    {"name": "Washington",   "lat": 38.91, "lon":  -77.04,
+    {"name": "Washington",  "lat": 38.91, "lon":  -77.04,
      "aliases": ["washington", "dc ", "d.c."]},
-    {"name": "Lyon",         "lat": 45.75, "lon":   4.85,
+    {"name": "Lyon",        "lat": 45.75, "lon":   4.85,
      "aliases": ["lyon"]},
-    {"name": "Marseille",    "lat": 43.30, "lon":   5.37,
+    {"name": "Marseille",   "lat": 43.30, "lon":   5.37,
      "aliases": ["marseille"]},
-    {"name": "Berlin",       "lat": 52.52, "lon":  13.41,
+    {"name": "Berlin",      "lat": 52.52, "lon":  13.41,
      "aliases": ["berlin", "germany temperature"]},
 ]
 
-# Mots-clés météo pour le filtre textuel (slug + question)
 WEATHER_KEYWORDS = [
     "temperature", "temp", "weather", "degrees", "celsius", "fahrenheit",
     "°f", "°c", "precipitation", "rainfall", "rain", "snow", "snowfall",
@@ -98,8 +94,6 @@ WEATHER_KEYWORDS = [
     "warm", "hot", "record high", "record low", "high temperature",
     "low temperature", "daily high", "daily low", "forecast",
 ]
-
-# Mots-clés dans les slugs (format kebab-case)
 WEATHER_SLUG_KEYWORDS = [
     "temperature", "weather", "rain", "snow", "precipitation",
     "celsius", "fahrenheit", "heat", "cold", "frost", "degree",
@@ -133,7 +127,7 @@ def safe_api_call(session: requests.Session, method: str, url: str,
         try:
             resp = session.request(method, url, **kwargs)
             if resp.status_code == 404:
-                log.warning(f"  🚫 [{label}] HTTP 404 — endpoint introuvable : {url}")
+                log.warning(f"  🚫 [{label}] HTTP 404 : {url}")
                 return None
             if resp.status_code >= 500:
                 log.warning(f"  ⚠️  [{label}] HTTP {resp.status_code} — tentative {attempt}/{max_attempts}")
@@ -149,7 +143,7 @@ def safe_api_call(session: requests.Session, method: str, url: str,
                 return data
             except ValueError:
                 preview = raw[:120].replace("\n", " ")
-                log.warning(f"  ⚠️  [{label}] JSON invalide — «{preview}» — tentative {attempt}/{max_attempts}")
+                log.warning(f"  ⚠️  [{label}] JSON invalide «{preview}» — tentative {attempt}/{max_attempts}")
                 continue
         except requests.exceptions.ConnectTimeout:
             log.warning(f"  ⏱️  [{label}] ConnectTimeout — tentative {attempt}/{max_attempts}")
@@ -161,7 +155,7 @@ def safe_api_call(session: requests.Session, method: str, url: str,
             log.error(f"  💥 [{label}] Erreur inattendue: {e}")
             break
 
-    log.error(f"  ❌ [{label}] API Polymarket unavailable — abandon après {max_attempts} tentatives.")
+    log.error(f"  ❌ [{label}] Unavailable — abandon après {max_attempts} tentatives.")
     return None
 
 def build_session() -> requests.Session:
@@ -245,124 +239,241 @@ def compute_bet_size(balance: float) -> float:
     else:
         return min(balance * 0.0125, 20.0)
 
-# ── APIs Météo ─────────────────────────────────────────────────────────────────
-def fetch_open_meteo(lat: float, lon: float, days: int = 7) -> dict | None:
+# ══════════════════════════════════════════════════════════════════════════════
+# ── APIs Météo : Open-Meteo + NOAA uniquement ─────────────────────────────────
+#
+# Open-Meteo fusionne en interne GFS (NOAA), ECMWF IFS et ERA5 selon la zone.
+# Pour distinguer les deux modèles on fait deux appels avec model= différent :
+#   • model=gfs_seamless   → GFS global NOAA
+#   • model=ecmwf_ifs04    → ECMWF IFS 0.4°
+# Cela donne 2 sources indépendantes sans aucune clé API.
+# La 3e source est l'API NOAA weather.gov (USA, nécessite token).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _open_meteo_call(lat: float, lon: float, model: str) -> dict | None:
+    """
+    Appel Open-Meteo avec un modèle spécifique.
+    models disponibles sans clé :
+      gfs_seamless   → NOAA GFS (global)
+      ecmwf_ifs04    → ECMWF IFS 0.4° (global)
+      ecmwf_ifs025   → ECMWF IFS 0.25° (si dispo)
+      best_match     → meilleur modèle local automatique
+    """
     try:
         r = requests.get(
             OPEN_METEO_URL,
             params={
-                "latitude": lat, "longitude": lon,
-                "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode",
-                "forecast_days": days, "timezone": "UTC",
+                "latitude":      lat,
+                "longitude":     lon,
+                "daily":         "temperature_2m_max,temperature_2m_min,precipitation_sum",
+                "forecast_days": 7,
+                "timezone":      "UTC",
+                "models":        model,
             },
             timeout=(10, 20),
         )
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        # Vérifie que la réponse contient des données valides
+        if "daily" not in data or not data["daily"].get("temperature_2m_max"):
+            log.warning(f"Open-Meteo [{model}] : données vides pour ({lat},{lon})")
+            return None
+        return data
+    except requests.exceptions.HTTPError as e:
+        log.warning(f"Open-Meteo [{model}] HTTPError: {e}")
+        return None
     except Exception as e:
-        log.warning(f"Open-Meteo erreur: {e}")
+        log.warning(f"Open-Meteo [{model}] erreur: {e}")
         return None
 
-def fetch_noaa_forecast(lat: float, lon: float) -> dict | None:
+def fetch_gfs(lat: float, lon: float) -> dict | None:
+    """
+    Source 1 : GFS (NOAA) via Open-Meteo.
+    Modèle global NOAA, résolution 0.25°, mise à jour 4×/jour.
+    Gratuit, sans clé.
+    """
+    data = _open_meteo_call(lat, lon, "gfs_seamless")
+    if data is None:
+        return None
+    daily = data["daily"]
+    temps = daily.get("temperature_2m_max", [])
+    if not temps:
+        return None
+    return {
+        "source":    "GFS",
+        "temp_max":  temps[0],
+        "temp_min":  (daily.get("temperature_2m_min") or [None])[0],
+        "precip_mm": (daily.get("precipitation_sum") or [0.0])[0] or 0.0,
+    }
+
+def fetch_ecmwf(lat: float, lon: float) -> dict | None:
+    """
+    Source 2 : ECMWF IFS via Open-Meteo.
+    Modèle européen de référence mondiale, résolution 0.4°.
+    Gratuit, sans clé (Open-Meteo réplique les données ECMWF publiques).
+    Fallback sur ecmwf_ifs025 si 04 indisponible.
+    """
+    data = _open_meteo_call(lat, lon, "ecmwf_ifs04")
+    if data is None:
+        # Certaines zones géographiques → essaie la version 0.25°
+        data = _open_meteo_call(lat, lon, "ecmwf_ifs025")
+    if data is None:
+        return None
+    daily = data["daily"]
+    temps = daily.get("temperature_2m_max", [])
+    if not temps:
+        return None
+    return {
+        "source":    "ECMWF",
+        "temp_max":  temps[0],
+        "temp_min":  (daily.get("temperature_2m_min") or [None])[0],
+        "precip_mm": (daily.get("precipitation_sum") or [0.0])[0] or 0.0,
+    }
+
+def fetch_noaa_api(lat: float, lon: float) -> dict | None:
+    """
+    Source 3 : API NOAA weather.gov (USA uniquement).
+    Requiert NOAA_API_TOKEN. Ignorée silencieusement si absent ou hors USA.
+    Fournit une prévision indépendante d'Open-Meteo (source on-premise NOAA).
+    """
     if not NOAA_API_TOKEN:
         return None
     try:
-        hdrs = {"User-Agent": "TirelireMeteoPension/1.4", "token": NOAA_API_TOKEN}
-        r = requests.get(f"https://api.weather.gov/points/{lat},{lon}",
-                         headers=hdrs, timeout=(10, 20))
-        if r.status_code != 200:
-            return None
-        r2 = requests.get(r.json()["properties"]["forecast"],
-                          headers=hdrs, timeout=(10, 20))
-        r2.raise_for_status()
-        return r2.json()
-    except Exception as e:
-        log.warning(f"NOAA erreur: {e}")
-        return None
-
-def fetch_openweather(lat: float, lon: float) -> dict | None:
-    if not OPENWEATHER_API_KEY:
-        return None
-    try:
+        hdrs = {
+            "User-Agent": "TirelireMeteoPension/1.5 contact@example.com",
+            "token":      NOAA_API_TOKEN,
+        }
+        # Étape 1 : point de grille
         r = requests.get(
-            "https://api.openweathermap.org/data/2.5/forecast",
-            params={"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY,
-                    "units": "metric", "cnt": 40},
+            f"https://api.weather.gov/points/{lat},{lon}",
+            headers=hdrs,
             timeout=(10, 20),
         )
-        r.raise_for_status()
-        return r.json()
+        if r.status_code != 200:
+            # Hors USA → 404 normal, pas de log d'erreur
+            return None
+        forecast_url = r.json()["properties"]["forecast"]
+
+        # Étape 2 : prévision
+        r2 = requests.get(forecast_url, headers=hdrs, timeout=(10, 20))
+        r2.raise_for_status()
+        periods = r2.json()["properties"].get("periods", [])
+        if not periods:
+            return None
+
+        # Prend la période diurne du premier jour
+        day_period = next(
+            (p for p in periods[:4] if p.get("isDaytime", True)), periods[0]
+        )
+        temp_f = day_period.get("temperature")
+        if temp_f is None:
+            return None
+
+        temp_c = (temp_f - 32) * 5 / 9
+        return {
+            "source":    "NOAA_API",
+            "temp_max":  round(temp_c, 1),
+            "temp_min":  None,
+            "precip_mm": None,    # NOAA weather.gov ne donne pas de mm directement
+        }
     except Exception as e:
-        log.warning(f"OpenWeather erreur: {e}")
+        log.warning(f"NOAA API erreur pour ({lat},{lon}): {e}")
         return None
 
 def build_consensus_forecast(city: dict) -> dict | None:
+    """
+    Agrège GFS + ECMWF + NOAA API en un consensus pondéré.
+
+    Sources actives :
+      • GFS (Open-Meteo/gfs_seamless)   — toujours disponible
+      • ECMWF (Open-Meteo/ecmwf_ifs04)  — toujours disponible
+      • NOAA API (weather.gov)           — USA seulement, si token configuré
+
+    Niveau de consensus basé sur le spread entre les modèles :
+      • STRONG   : spread < 1.0°C  (les 3 modèles d'accord)
+      • MODERATE : spread < 2.5°C
+      • WEAK     : spread ≥ 2.5°C  → pas de trade
+
+    Retourne None si aucune source disponible.
+    """
     lat, lon  = city["lat"], city["lon"]
     forecasts = []
-    om = fetch_open_meteo(lat, lon)
-    if om and "daily" in om:
-        temps = om["daily"].get("temperature_2m_max", [])
-        if temps:
-            forecasts.append({
-                "source": "OpenMeteo", "temp_max": temps[0],
-                "precip": om["daily"].get("precipitation_sum", [0])[0],
-            })
-    noaa = fetch_noaa_forecast(lat, lon)
-    if noaa and "properties" in noaa:
-        periods = noaa["properties"].get("periods", [])
-        if periods and periods[0].get("temperature"):
-            forecasts.append({
-                "source": "NOAA",
-                "temp_max": (periods[0]["temperature"] - 32) * 5 / 9,
-                "precip": None,
-            })
-    ow = fetch_openweather(lat, lon)
-    if ow and "list" in ow:
-        tomorrow = [x for x in ow["list"] if "12:00" in x.get("dt_txt", "")]
-        if tomorrow:
-            forecasts.append({
-                "source": "OpenWeather",
-                "temp_max": tomorrow[0]["main"]["temp_max"],
-                "precip": tomorrow[0].get("rain", {}).get("3h", 0),
-            })
+
+    # Source 1 : GFS
+    gfs = fetch_gfs(lat, lon)
+    if gfs:
+        forecasts.append(gfs)
+        log.debug(f"    GFS  {city['name']}: {gfs['temp_max']:.1f}°C")
+
+    # Source 2 : ECMWF
+    ecmwf = fetch_ecmwf(lat, lon)
+    if ecmwf:
+        forecasts.append(ecmwf)
+        log.debug(f"    ECMWF {city['name']}: {ecmwf['temp_max']:.1f}°C")
+
+    # Source 3 : NOAA API (USA, optionnelle)
+    noaa = fetch_noaa_api(lat, lon)
+    if noaa:
+        forecasts.append(noaa)
+        log.debug(f"    NOAA_API {city['name']}: {noaa['temp_max']:.1f}°C")
+
     if not forecasts:
+        log.warning(f"  ⚠️  Aucune prévision pour {city['name']}")
         return None
-    temps     = [f["temp_max"] for f in forecasts]
-    avg_temp  = sum(temps) / len(temps)
-    spread    = max(temps) - min(temps)
-    consensus = "STRONG" if spread < 1.0 else ("MODERATE" if spread < 2.5 else "WEAK")
-    precips   = [f["precip"] for f in forecasts if f["precip"] is not None]
+
+    # Calcul consensus
+    temps    = [f["temp_max"] for f in forecasts]
+    avg_temp = sum(temps) / len(temps)
+    spread   = max(temps) - min(temps)
+
+    if spread < 1.0:
+        consensus = "STRONG"
+    elif spread < 2.5:
+        consensus = "MODERATE"
+    else:
+        consensus = "WEAK"
+
+    # Précipitations moyennées sur les sources qui les fournissent
+    precip_vals = [
+        f["precip_mm"] for f in forecasts
+        if f.get("precip_mm") is not None
+    ]
+    avg_precip = round(sum(precip_vals) / len(precip_vals), 1) if precip_vals else 0.0
+
+    sources_names = [f["source"] for f in forecasts]
+    log.info(
+        f"  🌡️  {city['name']} | {avg_temp:.1f}°C ± {spread:.1f}°C "
+        f"[{consensus}] sources={sources_names}"
+    )
+
     return {
         "city":      city["name"],
         "temp_max":  round(avg_temp, 1),
-        "precip_mm": round(sum(precips) / len(precips), 1) if precips else 0.0,
+        "precip_mm": avg_precip,
         "spread":    round(spread, 2),
         "consensus": consensus,
         "sources":   len(forecasts),
+        "models":    sources_names,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Helpers filtre météo ──────────────────────────────────────────────────────
+# ── Helpers filtre marchés météo ──────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 def _text_is_weather(text: str) -> bool:
-    """Retourne True si le texte contient un mot-clé météo."""
     t = text.lower()
     return any(k in t for k in WEATHER_KEYWORDS)
 
 def _slug_is_weather(slug: str) -> bool:
-    """Retourne True si le slug contient un mot-clé météo (format kebab)."""
     s = slug.lower()
     return any(k in s for k in WEATHER_SLUG_KEYWORDS)
 
 def _market_search_text(market: dict) -> str:
-    """Agrège tous les champs textuels d'un market pour le filtrage."""
     return " ".join([
-        market.get("question", ""),
-        market.get("slug", ""),
-        market.get("title", ""),
+        market.get("question",       ""),
+        market.get("slug",           ""),
+        market.get("title",          ""),
         market.get("groupItemTitle", ""),
-        market.get("description", ""),
-        # Tags sous forme de labels
+        market.get("description",    ""),
         " ".join(
             t.get("label", "") + " " + t.get("slug", "")
             for t in market.get("tags", [])
@@ -370,13 +481,11 @@ def _market_search_text(market: dict) -> str:
     ]).lower()
 
 def _is_weather_market(market: dict) -> bool:
-    """Filtre complet : mot-clé météo dans texte OU slug."""
     text = _market_search_text(market)
     slug = market.get("slug", "")
     return _text_is_weather(text) or _slug_is_weather(slug)
 
 def _market_city(market: dict) -> dict | None:
-    """Associe un market à une ville surveillée (alias inclus)."""
     text = _market_search_text(market)
     for city in CITIES:
         if any(alias in text for alias in city["aliases"]):
@@ -384,27 +493,17 @@ def _market_city(market: dict) -> dict | None:
     return None
 
 def _market_priority(market: dict) -> tuple:
-    """
-    Score de priorité pour le tri final.
-    Retourne (ville_connue: 0/1, volume_24h: float) → tri décroissant.
-    """
-    city_match   = 1 if _market_city(market) else 0
-    vol24        = float(market.get("volume24hr", market.get("volume_24hr", 0)) or 0)
+    city_match = 1 if _market_city(market) else 0
+    vol24      = float(market.get("volume24hr", market.get("volume_24hr", 0)) or 0)
     return (city_match, vol24)
 
 def _extract_markets_from_events(events: list) -> list:
-    """
-    Extrait les markets depuis une liste d'events Gamma.
-    Chaque event contient un champ "markets" (liste).
-    Injecte les tags de l'event dans chaque market pour le filtrage.
-    """
     markets = []
     for event in events:
-        event_tags  = event.get("tags", [])
+        event_tags  = event.get("tags",  [])
         event_title = event.get("title", "")
-        event_slug  = event.get("slug", "")
+        event_slug  = event.get("slug",  "")
         for m in event.get("markets", []):
-            # Enrichit le market avec les métadonnées de l'event parent
             m.setdefault("tags", event_tags)
             if not m.get("groupItemTitle"):
                 m["groupItemTitle"] = event_title
@@ -419,9 +518,9 @@ def _extract_markets_from_events(events: list) -> list:
 class PolymarketClient:
 
     def __init__(self):
-        self.session      = build_session()
-        self._weather_tag_id = None      # découvert dynamiquement
-        self._tag_cache_ttl = 0          # timestamp d'expiration cache
+        self.session         = build_session()
+        self._weather_tag_id = None
+        self._tag_cache_ttl  = 0
         self._setup_signer()
         self._setup_web3()
 
@@ -451,22 +550,14 @@ class PolymarketClient:
                 log.warning("⚠️  Polygon RPC non connecté — redeem on-chain désactivé")
                 self.w3 = None
         except ImportError:
-            log.warning("web3 non installé — redeem on-chain désactivé")
+            log.warning("web3 non installé — redeem désactivé")
             self.w3 = None
 
-    # ── Découverte du tag_id weather ─────────────────────────────────────────
+    # ── Découverte tag_id weather ─────────────────────────────────────────────
     def _discover_weather_tag_id(self) -> int | None:
-        """
-        Interroge /tags pour trouver le tag_id correspondant à "weather".
-        Résultat mis en cache 24h dans TAG_CACHE_JSON (économie d'appels API).
-        """
         now = time.time()
-
-        # Cache mémoire valide ?
         if self._weather_tag_id and now < self._tag_cache_ttl:
             return self._weather_tag_id
-
-        # Cache fichier valide ?
         if TAG_CACHE_JSON.exists():
             try:
                 with open(TAG_CACHE_JSON) as f:
@@ -480,8 +571,6 @@ class PolymarketClient:
                 pass
 
         log.info("  🔍 Découverte tag_id 'weather' via /tags…")
-
-        # Cherche dans les 200 premiers tags
         for offset in [0, 100]:
             data = safe_api_call(
                 self.session, "GET", f"{GAMMA_BASE}/tags",
@@ -497,11 +586,11 @@ class PolymarketClient:
                     tag_id = int(tag.get("id", 0))
                     if tag_id:
                         log.info(
-                            f"  ✅ Tag weather trouvé : id={tag_id} "
+                            f"  ✅ Tag weather : id={tag_id} "
                             f"label='{tag.get('label')}' slug='{tag.get('slug')}'"
                         )
                         self._weather_tag_id = tag_id
-                        self._tag_cache_ttl  = now + 86400  # 24h
+                        self._tag_cache_ttl  = now + 86400
                         try:
                             with open(TAG_CACHE_JSON, "w") as f:
                                 json.dump({"tag_id": tag_id, "expires": self._tag_cache_ttl}, f)
@@ -509,21 +598,15 @@ class PolymarketClient:
                             pass
                         return tag_id
 
-        log.warning("  ⚠️  Tag 'weather' introuvable dans /tags → filtre textuel uniquement")
+        log.warning("  ⚠️  Tag 'weather' introuvable → filtre textuel uniquement")
         return None
 
-    # ── Couche 1 : events par tag_id weather ─────────────────────────────────
+    # ── Couche 1 : /events par tag_id weather ────────────────────────────────
     def _fetch_events_by_weather_tag(self, tag_id: int, limit: int = 200) -> list:
-        """
-        GET /events?tag_id=<weather>&related_tags=true&active=true&closed=false
-        Triés par volume 24h décroissant — les marchés météo les plus liquides.
-        """
         all_markets = []
         offset      = 0
-        page_size   = 50       # Gamma recommande ≤100 par page
-
-        log.info(f"  📡 [Couche 1] /events?tag_id={tag_id} (target={limit} marchés)")
-
+        page_size   = 50
+        log.info(f"  📡 [Couche 1] /events?tag_id={tag_id} (target={limit})")
         while len(all_markets) < limit:
             data = safe_api_call(
                 self.session, "GET", f"{GAMMA_BASE}/events",
@@ -541,19 +624,15 @@ class PolymarketClient:
             )
             if not data:
                 break
-
             events = data if isinstance(data, list) else data.get("data", [])
             if not events:
                 break
-
             batch = _extract_markets_from_events(events)
             all_markets.extend(batch)
             log.info(
-                f"    page offset={offset} → {len(events)} events, "
+                f"    offset={offset} → {len(events)} events, "
                 f"{len(batch)} marchés | total={len(all_markets)}"
             )
-
-            # Pagination : has_more ou liste pleine
             has_more = (
                 data.get("has_more", False) if isinstance(data, dict)
                 else len(events) == page_size
@@ -561,25 +640,17 @@ class PolymarketClient:
             if not has_more:
                 break
             offset += page_size
-
-        log.info(f"  ✅ [Couche 1] {len(all_markets)} marchés récupérés via tag_id={tag_id}")
+        log.info(f"  ✅ [Couche 1] {len(all_markets)} marchés via tag_id={tag_id}")
         return all_markets
 
-    # ── Couche 2 : events actifs + filtre textuel météo ───────────────────────
+    # ── Couche 2 : /events actifs + filtre textuel ────────────────────────────
     def _fetch_events_textual_filter(self, limit: int = 500) -> list:
-        """
-        GET /events?active=true&closed=false trié par volume.
-        Filtre côté client sur mots-clés météo dans slug/question/tags.
-        Pagine jusqu'à `limit` marchés météo trouvés ou 1000 events parcourus.
-        """
         weather_markets = []
         offset          = 0
         page_size       = 100
         events_scanned  = 0
-        max_events      = 1000   # limite raisonnable
-
+        max_events      = 1000
         log.info(f"  📡 [Couche 2] /events actifs + filtre textuel (target={limit})")
-
         while len(weather_markets) < limit and events_scanned < max_events:
             data = safe_api_call(
                 self.session, "GET", f"{GAMMA_BASE}/events",
@@ -595,24 +666,18 @@ class PolymarketClient:
             )
             if not data:
                 break
-
             events = data if isinstance(data, list) else data.get("data", [])
             if not events:
                 break
-
             events_scanned += len(events)
             batch = _extract_markets_from_events(events)
-
-            # Filtre météo + villes prioritaires
             for m in batch:
                 if _is_weather_market(m):
                     weather_markets.append(m)
-
             log.info(
-                f"    offset={offset} → {len(events)} events scannés "
-                f"| météo trouvés: {len(weather_markets)}"
+                f"    offset={offset} → {len(events)} events "
+                f"| météo cumulés: {len(weather_markets)}"
             )
-
             has_more = (
                 data.get("has_more", False) if isinstance(data, dict)
                 else len(events) == page_size
@@ -620,27 +685,20 @@ class PolymarketClient:
             if not has_more:
                 break
             offset += page_size
-
         log.info(
             f"  ✅ [Couche 2] {len(weather_markets)} marchés météo "
             f"sur {events_scanned} events scannés"
         )
         return weather_markets
 
-    # ── Couche 3 : /markets direct + filtre textuel (fallback) ───────────────
+    # ── Couche 3 : /markets direct (fallback) ────────────────────────────────
     def _fetch_markets_direct_filter(self, limit: int = 300) -> list:
-        """
-        GET /markets?active=true&closed=false — fallback si /events échoue.
-        Filtre côté client.
-        """
         weather_markets = []
         offset          = 0
         page_size       = 100
         markets_scanned = 0
         max_scan        = 1000
-
-        log.info(f"  📡 [Couche 3/fallback] /markets direct + filtre textuel")
-
+        log.info("  📡 [Couche 3/fallback] /markets direct + filtre textuel")
         while len(weather_markets) < limit and markets_scanned < max_scan:
             data = safe_api_call(
                 self.session, "GET", f"{GAMMA_BASE}/markets",
@@ -656,21 +714,17 @@ class PolymarketClient:
             )
             if not data:
                 break
-
             markets = data if isinstance(data, list) else data.get("data", [])
             if not markets:
                 break
-
             markets_scanned += len(markets)
             for m in markets:
                 if _is_weather_market(m):
                     weather_markets.append(m)
-
             log.info(
                 f"    offset={offset} → {len(markets)} marchés scannés "
                 f"| météo: {len(weather_markets)}"
             )
-
             has_more = (
                 data.get("has_more", False) if isinstance(data, dict)
                 else len(markets) == page_size
@@ -678,28 +732,11 @@ class PolymarketClient:
             if not has_more:
                 break
             offset += page_size
-
         log.info(f"  ✅ [Couche 3] {len(weather_markets)} marchés météo (fallback)")
         return weather_markets
 
-    # ── get_weather_markets — méthode principale ──────────────────────────────
+    # ── get_weather_markets ───────────────────────────────────────────────────
     def get_weather_markets(self, target: int = 500) -> list:
-        """
-        Récupère les marchés météo Polymarket en 3 couches successives :
-
-        Couche 1 : /events?tag_id=<weather> — précis, faible volume d'appels
-                   Nécessite de connaître le tag_id weather (découverte auto).
-
-        Couche 2 : /events?active=true + filtre textuel — large, robuste,
-                   scan jusqu'à 1000 events, arrêt dès target atteint.
-
-        Couche 3 : /markets direct + filtre textuel — fallback si /events échoue.
-
-        Tri final : villes prioritaires en tête, puis volume 24h décroissant.
-        Déduplication par conditionId.
-
-        Retourne jusqu'à `target` marchés météo.
-        """
         log.info(f"🌦️  Récupération marchés météo (target={target})…")
         all_markets: list = []
         seen_ids:    set  = set()
@@ -711,51 +748,40 @@ class PolymarketClient:
                     seen_ids.add(mid)
                     all_markets.append(m)
 
-        # ── Couche 1 : tag_id weather ──────────────────────────────────────
         tag_id = self._discover_weather_tag_id()
         if tag_id:
-            layer1 = self._fetch_events_by_weather_tag(tag_id, limit=target)
-            _add(layer1)
+            _add(self._fetch_events_by_weather_tag(tag_id, limit=target))
             log.info(f"  📊 Après Couche 1 : {len(all_markets)} uniques")
 
-        # ── Couche 2 : filtre textuel events ──────────────────────────────
-        # Toujours exécutée pour compléter/vérifier (évite faux négatifs du tag)
         if len(all_markets) < target:
-            layer2 = self._fetch_events_textual_filter(limit=target)
             before = len(all_markets)
-            _add(layer2)
+            _add(self._fetch_events_textual_filter(limit=target))
             log.info(
                 f"  📊 Après Couche 2 : {len(all_markets)} uniques "
                 f"(+{len(all_markets)-before} nouveaux)"
             )
 
-        # ── Couche 3 : fallback /markets direct ───────────────────────────
         if len(all_markets) == 0:
-            log.warning("  ↩️  Couches 1+2 vides → Couche 3 (fallback /markets)")
-            layer3 = self._fetch_markets_direct_filter(limit=target)
-            _add(layer3)
+            log.warning("  ↩️  Couches 1+2 vides → Couche 3 (fallback)")
+            _add(self._fetch_markets_direct_filter(limit=target))
             log.info(f"  📊 Après Couche 3 : {len(all_markets)} uniques")
 
-        # ── Tri final ──────────────────────────────────────────────────────
-        # Priorité : (ville connue DESC, volume24h DESC)
         all_markets.sort(key=_market_priority, reverse=True)
 
-        # Résumé
         city_matches = sum(1 for m in all_markets if _market_city(m))
         log.info(
-            f"✅ {len(all_markets)} marchés météo trouvés "
+            f"✅ {len(all_markets)} marchés météo "
             f"({city_matches} avec ville prioritaire)"
         )
         if all_markets:
             top = all_markets[0]
             log.info(
-                f"   Top marché : {top.get('question', top.get('slug', '?'))[:60]} "
+                f"   Top : {top.get('question', top.get('slug', '?'))[:60]} "
                 f"| vol24h={float(top.get('volume24hr', 0) or 0):.0f} USDC"
             )
-
         return all_markets[:target]
 
-    # ── get_orderbook ────────────────────────────────────────────────────────
+    # ── get_orderbook ─────────────────────────────────────────────────────────
     def get_orderbook(self, token_id: str) -> dict | None:
         return safe_api_call(
             self.session, "GET", f"{CLOB_BASE}/book",
@@ -763,18 +789,18 @@ class PolymarketClient:
             params={"token_id": token_id},
         )
 
-    # ── place_order ──────────────────────────────────────────────────────────
+    # ── place_order ───────────────────────────────────────────────────────────
     def place_order(self, token_id: str, price: float,
                     size: float, side: str = "BUY") -> dict | None:
         if not self.account:
-            log.info(f"[SIMULATION] Ordre {side} {size:.2f} USDC @ {price:.3f} sur {token_id[:12]}…")
+            log.info(f"[SIMULATION] {side} {size:.2f} USDC @ {price:.3f} sur {token_id[:12]}…")
             return {"status": "simulated", "token_id": token_id,
                     "price": price, "size": size}
         try:
             order = {
                 "orderType": "GTC", "tokenID": token_id, "side": side,
-                "price": str(round(price, 4)), "size": str(round(size, 2)),
-                "funder": self.address, "maker": self.address, "expiration": "0",
+                "price":     str(round(price, 4)), "size": str(round(size, 2)),
+                "funder":    self.address, "maker": self.address, "expiration": "0",
             }
             log.info(f"[ORDRE] {side} {size:.2f} USDC @ {price:.3f}")
             return order
@@ -782,11 +808,11 @@ class PolymarketClient:
             log.error(f"Erreur place_order: {e}")
             return None
 
-    # ── get_redeemable_positions ─────────────────────────────────────────────
+    # ── get_redeemable_positions ──────────────────────────────────────────────
     def get_redeemable_positions(self) -> list:
         if not self.address:
             return []
-        log.info("  🔍 Recherche positions redeemables (data-api)…")
+        log.info("  🔍 Recherche positions redeemables…")
         all_pos = safe_api_call(
             self.session, "GET", f"{DATA_BASE}/positions",
             label="data/redeemable_positions",
@@ -798,9 +824,8 @@ class PolymarketClient:
                 p for p in positions
                 if p.get("redeemable") is True and float(p.get("size", 0)) > 0
             ]
-            log.info(f"  📊 {len(positions)} positions totales, {len(redeemable)} redeemables")
+            log.info(f"  📊 {len(positions)} positions, {len(redeemable)} redeemables")
             return redeemable
-        # Fallback activity
         log.warning("  ↩️  data-api/positions indisponible → fallback /activity")
         activity = safe_api_call(
             self.session, "GET", f"{DATA_BASE}/activity",
@@ -822,7 +847,7 @@ class PolymarketClient:
             for a in acts
         ]
 
-    # ── redeem_position ──────────────────────────────────────────────────────
+    # ── redeem_position ───────────────────────────────────────────────────────
     def redeem_position(self, condition_id: str, outcome_index: int = 0) -> bool:
         if not self.account:
             log.info(f"[SIMULATION] Redeem {condition_id[:12]}…")
@@ -855,13 +880,13 @@ class PolymarketClient:
                 "gas":      200_000,
                 "gasPrice": self.w3.eth.gas_price,
             })
-            signed   = self.w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-            tx_hash  = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt  = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            signed  = self.w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
             if receipt.status == 1:
                 log.info(f"  ✅ Redeem on-chain OK — tx: {tx_hash.hex()[:20]}…")
                 return True
-            log.error(f"  ❌ Redeem on-chain FAILED — tx: {tx_hash.hex()[:20]}…")
+            log.error(f"  ❌ Redeem FAILED — tx: {tx_hash.hex()[:20]}…")
             return False
         except Exception as e:
             log.error(f"Erreur redeem on-chain {condition_id[:12]}: {e}")
@@ -899,7 +924,6 @@ def parse_temp_range(title: str) -> tuple:
 
 def select_bins(market: dict, forecast: dict) -> list:
     outcomes = market.get("outcomes", [])
-    # Gamma retourne parfois outcomes comme string JSON
     if isinstance(outcomes, str):
         try:
             outcomes = json.loads(outcomes)
@@ -907,7 +931,6 @@ def select_bins(market: dict, forecast: dict) -> list:
             outcomes = []
     if not outcomes:
         return []
-    # Gamma peut retourner outcomes comme liste de strings plutôt que dicts
     if outcomes and isinstance(outcomes[0], str):
         prices_raw = market.get("outcomePrices", "[]")
         if isinstance(prices_raw, str):
@@ -915,25 +938,25 @@ def select_bins(market: dict, forecast: dict) -> list:
                 prices_raw = json.loads(prices_raw)
             except Exception:
                 prices_raw = []
-        outcomes = [
-            {"title": outcomes[i], "price": prices_raw[i] if i < len(prices_raw) else "0.5",
-             "clobTokenIds": []}
-            for i in range(len(outcomes))
-        ]
-        # Injecte les clobTokenIds depuis le marché
         clob_ids = market.get("clobTokenIds", [])
         if isinstance(clob_ids, str):
             try:
                 clob_ids = json.loads(clob_ids)
             except Exception:
                 clob_ids = []
-        for i, o in enumerate(outcomes):
-            o["clobTokenIds"] = [clob_ids[i]] if i < len(clob_ids) else [""]
+        outcomes = [
+            {
+                "title":       outcomes[i],
+                "price":       prices_raw[i] if i < len(prices_raw) else "0.5",
+                "clobTokenIds": [clob_ids[i]] if i < len(clob_ids) else [""],
+            }
+            for i in range(len(outcomes))
+        ]
 
-    temp = forecast["temp_max"]
+    temp         = forecast["temp_max"]
     bins_with_ev = []
     for outcome in outcomes:
-        title         = outcome.get("title", "") if isinstance(outcome, dict) else str(outcome)
+        title             = outcome.get("title", "") if isinstance(outcome, dict) else str(outcome)
         bin_low, bin_high = parse_temp_range(title)
         if bin_low is None:
             continue
@@ -950,6 +973,7 @@ def select_bins(market: dict, forecast: dict) -> list:
             "market_price": market_price,
             "ev":           ev,
         })
+
     bins_with_ev.sort(key=lambda x: abs(((x["bin_low"] + x["bin_high"]) / 2) - temp))
     return [b for b in bins_with_ev if b["ev"] > EV_THRESHOLD][:MAX_BINS]
 
@@ -957,8 +981,8 @@ def select_bins(market: dict, forecast: dict) -> list:
 def check_daily_reset(state: dict) -> dict:
     today = datetime.utcnow().strftime("%Y-%m-%d")
     if state["daily_reset"] != today:
-        log.info(f"🌅 Nouveau jour {today} — Reset PnL journalier (était {state['daily_pnl']:.2f} USDC)")
-        state["daily_pnl"] = 0.0
+        log.info(f"🌅 Nouveau jour {today} — Reset PnL (était {state['daily_pnl']:.2f} USDC)")
+        state["daily_pnl"]  = 0.0
         state["daily_reset"] = today
     return state
 
@@ -969,7 +993,7 @@ def is_paused(state: dict) -> bool:
             remaining = int((pause_end - datetime.utcnow()).total_seconds() // 60)
             log.info(f"⏸️  Bot en pause — encore {remaining} min")
             return True
-        log.info("▶️  Pause terminée, reprise des trades")
+        log.info("▶️  Pause terminée")
         state["paused_until"] = None
     return False
 
@@ -979,7 +1003,7 @@ def check_daily_loss(state: dict, balance: float) -> bool:
         pause_until = (datetime.utcnow() + timedelta(hours=24)).isoformat()
         state["paused_until"] = pause_until
         log.warning(
-            f"🛡️  PROTECTION ACTIVÉE — Perte journalière {loss_pct*100:.1f}% > "
+            f"🛡️  PROTECTION ACTIVÉE — Perte {loss_pct*100:.1f}% > "
             f"{DAILY_LOSS_LIMIT*100:.0f}% — Pause jusqu'à {pause_until[:16]}"
         )
         return True
@@ -992,7 +1016,7 @@ def check_milestones(balance: float, state: dict):
             state.setdefault("milestones_hit", []).append(label)
             log.info(
                 f"🎉 FÉLICITATIONS ! Capital ≥ {m} USDC ({balance:.2f} USDC) — "
-                f"Nouveau palier atteint ! La tirelire grossit 💰"
+                f"La tirelire grossit 💰"
             )
 
 # ── Redeem automatique ─────────────────────────────────────────────────────────
@@ -1035,10 +1059,11 @@ def auto_redeem(client: PolymarketClient, state: dict, cal: dict) -> float:
 
 # ── Boucle principale ──────────────────────────────────────────────────────────
 def run():
-    log.info("🌤️  Tirelire Météo Pension v1.4 démarrée — Ultra-safe mode")
-    log.info(f"📂 Données dans : {DATA_DIR}")
-    log.info(f"⏱️  Scan toutes les {SCAN_INTERVAL//60} minutes")
-    log.info(f"🗺️  APIs : GAMMA={GAMMA_BASE} | DATA={DATA_BASE} | CLOB={CLOB_BASE}")
+    log.info("🌤️  Tirelire Météo Pension v1.5 démarrée — Ultra-safe mode")
+    log.info(f"📂 Données : {DATA_DIR}")
+    log.info(f"⏱️  Scan toutes les {SCAN_INTERVAL//60} min")
+    log.info(f"🌡️  Sources météo : GFS (Open-Meteo) + ECMWF (Open-Meteo)"
+             + (" + NOAA API" if NOAA_API_TOKEN else " [NOAA API désactivé — pas de token]"))
     log.info(f"🏙️  Villes : {', '.join(c['name'] for c in CITIES)}")
 
     init_csv()
@@ -1070,13 +1095,11 @@ def run():
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # Récupération marchés météo — 3 couches
         markets = client.get_weather_markets(target=500)
         log.info(f"📊 {len(markets)} marchés météo à analyser")
 
         trades_this_cycle = 0
         for market in markets:
-            # Ville associée (obligatoire pour la prévision météo)
             city = _market_city(market)
             if not city:
                 continue
@@ -1105,8 +1128,8 @@ def run():
 
             log.info(f"  🎯 {city['name']} | {market_name}")
             log.info(
-                f"     Prévision: {forecast['temp_max']}°C | "
-                f"Spread: {forecast['spread']}°C | Consensus: {forecast['consensus']}"
+                f"     Prévision: {forecast['temp_max']}°C ± {forecast['spread']}°C "
+                f"[{forecast['consensus']}] modèles={forecast['models']}"
             )
 
             for b in selected_bins:
@@ -1115,7 +1138,6 @@ def run():
                 bin_bet = round((b["ev"] / total_ev) * total_bet * conf_factor, 2)
                 if bin_bet < 0.50:
                     continue
-
                 result = client.place_order(
                     token_id=b["token_id"], price=b["market_price"], size=bin_bet
                 )
@@ -1135,7 +1157,8 @@ def run():
                         "ev":            b["ev"],
                         "notes":         (
                             f"Consensus={forecast['consensus']} "
-                            f"Spread={forecast['spread']} Conf={conf_factor}"
+                            f"Spread={forecast['spread']} Conf={conf_factor} "
+                            f"Models={forecast['models']}"
                         ),
                     })
                     log.info(
